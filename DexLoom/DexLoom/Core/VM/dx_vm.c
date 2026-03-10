@@ -20,7 +20,10 @@ DxVM *dx_vm_create(DxContext *ctx) {
     memset(vm, 0, sizeof(DxVM));
     vm->ctx = ctx;
     vm->insn_limit = DX_MAX_INSTRUCTIONS;
-    DX_INFO(TAG, "VM created (insn limit=%u)", DX_MAX_INSTRUCTIONS);
+    vm->watchdog_timeout_ms = 10000;  // 10 seconds default
+    vm->watchdog_start_time = 0;
+    vm->watchdog_triggered = false;
+    DX_INFO(TAG, "VM created (insn limit=%u, watchdog=%ums)", DX_MAX_INSTRUCTIONS, vm->watchdog_timeout_ms);
     return vm;
 }
 
@@ -2315,6 +2318,16 @@ static DxClass *extract_dxclass(DxObject *class_obj) {
     return NULL;
 }
 
+// Helper: create an annotation object with element data stored in field[0]
+static DxObject *vm_create_annotation_object(DxVM *vm, DxClass *anno_cls, const DxAnnotationEntry *entry) {
+    DxObject *anno_obj = dx_vm_alloc_object(vm, anno_cls);
+    if (anno_obj && anno_obj->fields && anno_cls->instance_field_count >= 2) {
+        anno_obj->fields[0].tag = DX_VAL_INT;
+        anno_obj->fields[0].i = (int32_t)(uintptr_t)entry;
+    }
+    return anno_obj;
+}
+
 // Class.getAnnotation(Class annotationType) -> Annotation or null
 static DxResult native_class_getannotation(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
     (void)arg_count;
@@ -2325,8 +2338,7 @@ static DxResult native_class_getannotation(DxVM *vm, DxFrame *frame, DxValue *ar
     if (cls && anno_type && cls->annotations && anno_type->descriptor) {
         for (uint32_t i = 0; i < cls->annotation_count; i++) {
             if (cls->annotations[i].type && strcmp(cls->annotations[i].type, anno_type->descriptor) == 0) {
-                // Return an object of the annotation type
-                DxObject *anno_obj = dx_vm_alloc_object(vm, anno_type);
+                DxObject *anno_obj = vm_create_annotation_object(vm, anno_type, &cls->annotations[i]);
                 frame->result = anno_obj ? DX_OBJ_VALUE(anno_obj) : DX_NULL_VALUE;
                 frame->has_result = true;
                 return DX_OK;
@@ -2349,7 +2361,7 @@ static DxResult native_class_getannotations(DxVM *vm, DxFrame *frame, DxValue *a
         for (uint32_t i = 0; i < count; i++) {
             DxClass *anno_cls = dx_vm_find_class(vm, cls->annotations[i].type);
             if (anno_cls) {
-                DxObject *anno_obj = dx_vm_alloc_object(vm, anno_cls);
+                DxObject *anno_obj = vm_create_annotation_object(vm, anno_cls, &cls->annotations[i]);
                 if (anno_obj) arr->array_elements[i] = DX_OBJ_VALUE(anno_obj);
             }
         }
@@ -2823,7 +2835,7 @@ static DxResult native_method_getannotation(DxVM *vm, DxFrame *frame, DxValue *a
     if (method && anno_type && method->annotations && anno_type->descriptor) {
         for (uint32_t i = 0; i < method->annotation_count; i++) {
             if (method->annotations[i].type && strcmp(method->annotations[i].type, anno_type->descriptor) == 0) {
-                DxObject *anno_obj = dx_vm_alloc_object(vm, anno_type);
+                DxObject *anno_obj = vm_create_annotation_object(vm, anno_type, &method->annotations[i]);
                 frame->result = anno_obj ? DX_OBJ_VALUE(anno_obj) : DX_NULL_VALUE;
                 frame->has_result = true;
                 return DX_OK;
@@ -2852,7 +2864,7 @@ static DxResult native_method_getannotations(DxVM *vm, DxFrame *frame, DxValue *
         for (uint32_t i = 0; i < count; i++) {
             DxClass *anno_cls = dx_vm_find_class(vm, method->annotations[i].type);
             if (anno_cls) {
-                DxObject *anno_obj = dx_vm_alloc_object(vm, anno_cls);
+                DxObject *anno_obj = vm_create_annotation_object(vm, anno_cls, &method->annotations[i]);
                 if (anno_obj) arr->array_elements[i] = DX_OBJ_VALUE(anno_obj);
             }
         }
@@ -3791,6 +3803,26 @@ DxClass *dx_vm_find_class(DxVM *vm, const char *descriptor) {
     return NULL;
 }
 
+const DxAnnotationEntry *dx_class_get_annotation(DxClass *cls, const char *type_desc) {
+    if (!cls || !type_desc || !cls->annotations) return NULL;
+    for (uint32_t i = 0; i < cls->annotation_count; i++) {
+        if (cls->annotations[i].type && strcmp(cls->annotations[i].type, type_desc) == 0) {
+            return &cls->annotations[i];
+        }
+    }
+    return NULL;
+}
+
+const DxAnnotationEntry *dx_method_get_annotation(DxMethod *method, const char *type_desc) {
+    if (!method || !type_desc || !method->annotations) return NULL;
+    for (uint32_t i = 0; i < method->annotation_count; i++) {
+        if (method->annotations[i].type && strcmp(method->annotations[i].type, type_desc) == 0) {
+            return &method->annotations[i];
+        }
+    }
+    return NULL;
+}
+
 DxResult dx_vm_load_class(DxVM *vm, const char *descriptor, DxClass **out) {
     if (!vm || !descriptor) return DX_ERR_NULL_PTR;
 
@@ -4060,7 +4092,7 @@ DxResult dx_vm_load_class(DxVM *vm, const char *descriptor, DxClass **out) {
             if (ann_off != 0) {
                 DxAnnotationsDirectory ann_dir;
                 if (dx_dex_parse_annotations(found_dex, ann_off, &ann_dir) == DX_OK) {
-                    // Store class-level annotations
+                    // Store class-level annotations (steal element ownership from directory)
                     if (ann_dir.class_annotation_count > 0) {
                         cls->annotations = (typeof(cls->annotations))dx_malloc(
                             sizeof(*cls->annotations) * ann_dir.class_annotation_count);
@@ -4069,10 +4101,15 @@ DxResult dx_vm_load_class(DxVM *vm, const char *descriptor, DxClass **out) {
                             for (uint32_t a = 0; a < ann_dir.class_annotation_count; a++) {
                                 cls->annotations[a].type = ann_dir.class_annotations[a].type;
                                 cls->annotations[a].visibility = ann_dir.class_annotations[a].visibility;
+                                // Steal elements from directory (transfer ownership)
+                                cls->annotations[a].elements = ann_dir.class_annotations[a].elements;
+                                cls->annotations[a].element_count = ann_dir.class_annotations[a].element_count;
+                                ann_dir.class_annotations[a].elements = NULL;
+                                ann_dir.class_annotations[a].element_count = 0;
                             }
                         }
                     }
-                    // Store method-level annotations
+                    // Store method-level annotations (steal element ownership)
                     for (uint32_t ma = 0; ma < ann_dir.annotated_method_count; ma++) {
                         uint32_t midx = ann_dir.method_idxs[ma];
                         // Find matching DxMethod in direct or virtual methods
@@ -4100,6 +4137,10 @@ DxResult dx_vm_load_class(DxVM *vm, const char *descriptor, DxClass **out) {
                                 for (uint32_t a = 0; a < cnt; a++) {
                                     target->annotations[a].type = ann_dir.method_annotations[ma][a].type;
                                     target->annotations[a].visibility = ann_dir.method_annotations[ma][a].visibility;
+                                    target->annotations[a].elements = ann_dir.method_annotations[ma][a].elements;
+                                    target->annotations[a].element_count = ann_dir.method_annotations[ma][a].element_count;
+                                    ann_dir.method_annotations[ma][a].elements = NULL;
+                                    ann_dir.method_annotations[ma][a].element_count = 0;
                                 }
                             }
                         }
@@ -4855,4 +4896,317 @@ char *dx_vm_get_last_error_detail(DxVM *vm) {
     }
 
     return dx_strdup(buf);
+}
+
+// ============================================================
+// invoke-custom support: LambdaMetafactory + StringConcatFactory
+// ============================================================
+
+// Native dispatch for lambda proxy objects.
+// field[0] = captured args array (or NULL), field[1] = impl_method_idx (int), field[2] = impl_kind (int)
+static DxResult native_lambda_dispatch(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    // 'this' is args[0]
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (!self || !self->fields) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    DxObject *captured = (self->fields[0].tag == DX_VAL_OBJ) ? self->fields[0].obj : NULL;
+    uint32_t impl_method_idx = (uint32_t)self->fields[1].i;
+    (void)self->fields[2]; // impl_kind, reserved for future use
+
+    // Build argument list: captured args first, then lambda call args (skip 'this')
+    uint32_t captured_count = (captured && captured->is_array) ? captured->array_length : 0;
+    uint32_t lambda_args = (arg_count > 1) ? arg_count - 1 : 0;
+    uint32_t total_args = captured_count + lambda_args;
+
+    DxValue call_args[DX_MAX_REGISTERS];
+    if (total_args > DX_MAX_REGISTERS) total_args = DX_MAX_REGISTERS;
+
+    uint32_t ci = 0;
+    for (uint32_t i = 0; i < captured_count && ci < total_args; i++) {
+        call_args[ci++] = captured->array_elements[i];
+    }
+    for (uint32_t i = 1; i < arg_count && ci < total_args; i++) {
+        call_args[ci++] = args[i];
+    }
+
+    // Resolve the implementation method
+    DxMethod *impl = dx_vm_resolve_method(vm, impl_method_idx);
+    if (!impl) {
+        DX_WARN(TAG, "Lambda: cannot resolve impl method idx=%u", impl_method_idx);
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    DxValue result = DX_NULL_VALUE;
+    DxResult res = dx_vm_execute_method(vm, impl, call_args, ci, &result);
+    frame->result = result;
+    frame->has_result = true;
+
+    if (res == DX_ERR_EXCEPTION) return DX_ERR_EXCEPTION;
+    return DX_OK;
+}
+
+// Helper: convert a DxValue to a string representation for StringConcatFactory
+static const char *dx_value_to_str(DxVM *vm, DxValue val, char *buf, size_t bufsz) {
+    switch (val.tag) {
+        case DX_VAL_INT:
+            snprintf(buf, bufsz, "%d", val.i);
+            return buf;
+        case DX_VAL_LONG:
+            snprintf(buf, bufsz, "%lld", (long long)val.l);
+            return buf;
+        case DX_VAL_FLOAT:
+            snprintf(buf, bufsz, "%g", (double)val.f);
+            return buf;
+        case DX_VAL_DOUBLE:
+            snprintf(buf, bufsz, "%g", val.d);
+            return buf;
+        case DX_VAL_OBJ:
+            if (!val.obj) return "null";
+            {
+                const char *s = dx_vm_get_string_value(val.obj);
+                if (s) return s;
+                if (val.obj->klass && val.obj->fields) {
+                    const char *desc = val.obj->klass->descriptor;
+                    if (desc) {
+                        if (strstr(desc, "Integer;") || strstr(desc, "Long;") ||
+                            strstr(desc, "Short;") || strstr(desc, "Byte;")) {
+                            snprintf(buf, bufsz, "%d", val.obj->fields[0].i);
+                            return buf;
+                        }
+                        if (strstr(desc, "Boolean;")) {
+                            return val.obj->fields[0].i ? "true" : "false";
+                        }
+                        if (strstr(desc, "Float;")) {
+                            snprintf(buf, bufsz, "%g", (double)val.obj->fields[0].f);
+                            return buf;
+                        }
+                        if (strstr(desc, "Double;")) {
+                            snprintf(buf, bufsz, "%g", val.obj->fields[0].d);
+                            return buf;
+                        }
+                        if (strstr(desc, "Character;")) {
+                            snprintf(buf, bufsz, "%c", (char)val.obj->fields[0].i);
+                            return buf;
+                        }
+                    }
+                }
+                snprintf(buf, bufsz, "%s@%p",
+                         val.obj->klass ? val.obj->klass->descriptor : "Object",
+                         (void *)val.obj);
+                return buf;
+            }
+        default:
+            return "";
+    }
+}
+
+DxResult dx_vm_invoke_custom(DxVM *vm, DxFrame *frame, uint32_t call_site_idx,
+                              DxValue *args, uint32_t arg_count) {
+    if (!vm || !frame) return DX_ERR_NULL_PTR;
+
+    // Get the DEX file from the current method
+    DxDexFile *dex = NULL;
+    if (frame->method && frame->method->declaring_class &&
+        frame->method->declaring_class->dex_file) {
+        dex = frame->method->declaring_class->dex_file;
+    }
+    if (!dex) dex = vm->dex;
+    if (!dex) {
+        DX_WARN(TAG, "invoke-custom: no DEX file available");
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    const DxCallSite *cs = dx_dex_get_call_site(dex, call_site_idx);
+    if (!cs) {
+        DX_WARN(TAG, "invoke-custom: call site %u not found or not parsed", call_site_idx);
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // ---- StringConcatFactory ----
+    if (cs->is_string_concat) {
+        const char *recipe = cs->concat_recipe;
+        if (!recipe) recipe = "";
+
+        char result_buf[4096];
+        size_t pos = 0;
+        uint32_t arg_idx = 0;
+
+        for (const char *rp = recipe; *rp && pos < sizeof(result_buf) - 1; rp++) {
+            if (*rp == '\x01') {
+                // Replace placeholder with next argument
+                if (arg_idx < arg_count) {
+                    char vbuf[256];
+                    const char *s = dx_value_to_str(vm, args[arg_idx], vbuf, sizeof(vbuf));
+                    size_t slen = strlen(s);
+                    if (pos + slen < sizeof(result_buf) - 1) {
+                        memcpy(result_buf + pos, s, slen);
+                        pos += slen;
+                    }
+                    arg_idx++;
+                }
+            } else if (*rp == '\x02') {
+                // \x02 = constant from bootstrap args (skip)
+            } else {
+                result_buf[pos++] = *rp;
+            }
+        }
+        result_buf[pos] = '\0';
+
+        DxObject *str = dx_vm_create_string(vm, result_buf);
+        frame->result = str ? DX_OBJ_VALUE(str) : DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // ---- LambdaMetafactory ----
+    // Create a synthetic lambda class implementing the functional interface
+
+    const char *iface_desc = NULL;
+    if (cs->proto_idx < dex->proto_count) {
+        uint32_t ret_type_idx = dex->proto_ids[cs->proto_idx].return_type_idx;
+        iface_desc = dx_dex_get_type(dex, ret_type_idx);
+    }
+
+    static int lambda_counter = 0;
+    char lambda_desc[128];
+    snprintf(lambda_desc, sizeof(lambda_desc), "L$Lambda%d;", lambda_counter++);
+
+    DxClass *lambda_cls = (DxClass *)dx_malloc(sizeof(DxClass));
+    if (!lambda_cls) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+    memset(lambda_cls, 0, sizeof(DxClass));
+
+    lambda_cls->descriptor = dx_strdup(lambda_desc);
+    lambda_cls->super_class = vm->class_object;
+    lambda_cls->status = DX_CLASS_INITIALIZED;
+    lambda_cls->is_framework = true;
+    lambda_cls->instance_field_count = 4; // [0]=captured, [1]=impl_method_idx, [2]=impl_kind, [3]=reserved
+
+    if (iface_desc) {
+        lambda_cls->interface_count = 1;
+        lambda_cls->interfaces = (const char **)dx_malloc(sizeof(char *));
+        if (lambda_cls->interfaces) {
+            lambda_cls->interfaces[0] = iface_desc;
+        }
+    }
+
+    // Create the virtual method for the functional interface method
+    lambda_cls->virtual_methods = (DxMethod *)dx_malloc(sizeof(DxMethod));
+    if (lambda_cls->virtual_methods) {
+        memset(lambda_cls->virtual_methods, 0, sizeof(DxMethod));
+        lambda_cls->virtual_methods[0].name = cs->method_name;
+        lambda_cls->virtual_methods[0].declaring_class = lambda_cls;
+        lambda_cls->virtual_methods[0].access_flags = DX_ACC_PUBLIC;
+        lambda_cls->virtual_methods[0].native_fn = native_lambda_dispatch;
+        lambda_cls->virtual_methods[0].is_native = true;
+        lambda_cls->virtual_methods[0].vtable_idx = 0;
+
+        // Get shorty from erased proto
+        if (cs->proto_idx < dex->proto_count) {
+            uint32_t shorty_idx = dex->proto_ids[cs->proto_idx].shorty_idx;
+            lambda_cls->virtual_methods[0].shorty = dx_dex_get_string(dex, shorty_idx);
+        }
+
+        lambda_cls->virtual_method_count = 1;
+    }
+
+    // Register in VM
+    if (vm->class_count < DX_MAX_CLASSES) {
+        vm->classes[vm->class_count++] = lambda_cls;
+        dx_vm_class_hash_insert(vm, lambda_cls);
+    }
+
+    // Allocate the lambda instance
+    DxObject *lambda_obj = dx_vm_alloc_object(vm, lambda_cls);
+    if (!lambda_obj) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // Capture closed-over arguments
+    if (arg_count > 0) {
+        DxObject *captured = dx_vm_alloc_array(vm, arg_count);
+        if (captured) {
+            for (uint32_t i = 0; i < arg_count; i++) {
+                captured->array_elements[i] = args[i];
+            }
+            lambda_obj->fields[0] = DX_OBJ_VALUE(captured);
+        }
+    }
+
+    lambda_obj->fields[1] = DX_INT_VALUE((int32_t)cs->impl_method_idx);
+    lambda_obj->fields[2] = DX_INT_VALUE((int32_t)cs->impl_kind);
+
+    frame->result = DX_OBJ_VALUE(lambda_obj);
+    frame->has_result = true;
+
+    DX_DEBUG(TAG, "invoke-custom: created lambda %s implementing %s.%s (impl method %u)",
+             lambda_desc, iface_desc ? iface_desc : "?",
+             cs->method_name ? cs->method_name : "?", cs->impl_method_idx);
+
+    return DX_OK;
+}
+
+// ─── GC collect (public entry point for memory-pressure handling) ───
+
+void dx_vm_gc_collect(DxVM *vm) {
+    if (!vm) return;
+    DX_INFO(TAG, "GC collect triggered (memory pressure or manual)");
+    dx_vm_gc(vm);
+}
+
+// ─── Missing feature tracking ───
+
+void dx_vm_report_missing_feature(DxVM *vm, const char *feature) {
+    if (!vm || !feature) return;
+
+    // Deduplicate: don't record the same feature twice
+    for (uint32_t i = 0; i < vm->missing_features.count; i++) {
+        if (strcmp(vm->missing_features.features[i], feature) == 0) {
+            return;
+        }
+    }
+
+    if (vm->missing_features.count >= DX_MAX_MISSING_FEATURES) {
+        DX_WARN(TAG, "Missing feature table full, dropping: %s", feature);
+        return;
+    }
+
+    snprintf(vm->missing_features.features[vm->missing_features.count],
+             sizeof(vm->missing_features.features[0]),
+             "%s", feature);
+    vm->missing_features.count++;
+    DX_WARN(TAG, "Unsupported feature used: %s", feature);
+}
+
+const char *dx_vm_get_missing_features(DxVM *vm) {
+    static char buf[4096];
+    if (!vm || vm->missing_features.count == 0) {
+        snprintf(buf, sizeof(buf), "(none)");
+        return buf;
+    }
+
+    int pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "Unsupported features encountered (%u):\n",
+                    vm->missing_features.count);
+    for (uint32_t i = 0; i < vm->missing_features.count && pos < (int)sizeof(buf) - 140; i++) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "  - %s\n", vm->missing_features.features[i]);
+    }
+    return buf;
 }

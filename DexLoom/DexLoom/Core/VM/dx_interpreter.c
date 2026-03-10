@@ -1,12 +1,30 @@
 #include "../Include/dx_vm.h"
+#include "../Include/dx_dex.h"
 #include "../Include/dx_log.h"
 #include "../Include/dx_runtime.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
+#include <mach/mach_time.h>
+
+// Wall-clock milliseconds using Mach absolute time
+static uint64_t dx_current_time_ms(void) {
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    uint64_t ns = mach_absolute_time() * tb.numer / tb.denom;
+    return ns / 1000000ULL;
+}
 
 #define TAG "Interp"
+
+// Computed goto (threaded dispatch) for interpreter speedup.
+// Uses GCC/Clang's &&label extension; falls back to switch on other compilers.
+#if defined(__GNUC__) || defined(__clang__)
+#define USE_COMPUTED_GOTO 1
+#else
+#define USE_COMPUTED_GOTO 0
+#endif
 
 #include "../Include/dx_memory.h"
 
@@ -369,6 +387,81 @@ static DxResult handle_invoke(DxVM *vm, DxFrame *frame, const uint16_t *code,
         argc = pack_varargs(vm, call_args, argc, fixed_params, is_static);
     }
 
+    // Annotation element dispatch: when calling an abstract method on an annotation
+    // object (e.g., @GET("/path").value()), look up the element from the DxAnnotationEntry
+    // stored in the object's field[0].
+    if (target && !target->has_code && !target->is_native
+        && target->declaring_class
+        && (target->declaring_class->access_flags & DX_ACC_ANNOTATION)
+        && argc > 0 && call_args[0].tag == DX_VAL_OBJ && call_args[0].obj) {
+        DxObject *anno_obj = call_args[0].obj;
+        if (anno_obj->fields && anno_obj->fields[0].tag == DX_VAL_INT
+            && anno_obj->fields[0].i != 0) {
+            const DxAnnotationEntry *entry = (const DxAnnotationEntry *)(uintptr_t)anno_obj->fields[0].i;
+            const char *elem_name = target->name;
+            // Search annotation elements for a matching name
+            for (uint32_t ei = 0; ei < entry->element_count; ei++) {
+                if (entry->elements[ei].name && strcmp(entry->elements[ei].name, elem_name) == 0) {
+                    const DxAnnotationElement *elem = &entry->elements[ei];
+                    switch (elem->val_type) {
+                        case DX_ANNO_VAL_STRING: {
+                            DxObject *str = dx_vm_create_string(vm, elem->str_value ? elem->str_value : "");
+                            frame->result = str ? DX_OBJ_VALUE(str) : DX_NULL_VALUE;
+                            break;
+                        }
+                        case DX_ANNO_VAL_BYTE:
+                        case DX_ANNO_VAL_SHORT:
+                        case DX_ANNO_VAL_CHAR:
+                        case DX_ANNO_VAL_INT:
+                        case DX_ANNO_VAL_BOOLEAN:
+                            frame->result = DX_INT_VALUE(elem->i_value);
+                            break;
+                        case DX_ANNO_VAL_LONG:
+                            frame->result = (DxValue){.tag = DX_VAL_LONG, .l = elem->l_value};
+                            break;
+                        case DX_ANNO_VAL_FLOAT:
+                            frame->result = (DxValue){.tag = DX_VAL_FLOAT, .f = elem->f_value};
+                            break;
+                        case DX_ANNO_VAL_DOUBLE:
+                            frame->result = (DxValue){.tag = DX_VAL_DOUBLE, .d = elem->d_value};
+                            break;
+                        case DX_ANNO_VAL_TYPE: {
+                            DxObject *str = dx_vm_create_string(vm, elem->str_value ? elem->str_value : "");
+                            frame->result = str ? DX_OBJ_VALUE(str) : DX_NULL_VALUE;
+                            break;
+                        }
+                        case DX_ANNO_VAL_ENUM: {
+                            DxObject *str = dx_vm_create_string(vm, elem->str_value ? elem->str_value : "");
+                            frame->result = str ? DX_OBJ_VALUE(str) : DX_NULL_VALUE;
+                            break;
+                        }
+                        default:
+                            frame->result = DX_NULL_VALUE;
+                            break;
+                    }
+                    frame->has_result = true;
+                    return DX_OK;
+                }
+            }
+        }
+        // Also handle annotationType() for annotation objects
+        if (strcmp(target->name, "annotationType") == 0) {
+            DxClass *class_cls = dx_vm_find_class(vm, "Ljava/lang/Class;");
+            if (class_cls) {
+                DxObject *cls_obj = dx_vm_alloc_object(vm, class_cls);
+                if (cls_obj && cls_obj->fields && class_cls->instance_field_count > 0) {
+                    cls_obj->fields[0].tag = DX_VAL_INT;
+                    cls_obj->fields[0].i = (int32_t)(uintptr_t)anno_obj->klass;
+                }
+                frame->result = cls_obj ? DX_OBJ_VALUE(cls_obj) : DX_NULL_VALUE;
+            } else {
+                frame->result = DX_NULL_VALUE;
+            }
+            frame->has_result = true;
+            return DX_OK;
+        }
+    }
+
     DxValue call_result;
     memset(&call_result, 0, sizeof(call_result));
     DxResult res = dx_vm_execute_method(vm, target, call_args, argc, &call_result);
@@ -528,6 +621,70 @@ static DxResult handle_invoke_range(DxVM *vm, DxFrame *frame, const uint16_t *co
         clamped_argc = pack_varargs(vm, call_args, clamped_argc, fixed_params, is_static);
     }
 
+    // Annotation element dispatch (range variant)
+    if (target && !target->has_code && !target->is_native
+        && target->declaring_class
+        && (target->declaring_class->access_flags & DX_ACC_ANNOTATION)
+        && clamped_argc > 0 && call_args[0].tag == DX_VAL_OBJ && call_args[0].obj) {
+        DxObject *anno_obj = call_args[0].obj;
+        if (anno_obj->fields && anno_obj->fields[0].tag == DX_VAL_INT
+            && anno_obj->fields[0].i != 0) {
+            const DxAnnotationEntry *entry = (const DxAnnotationEntry *)(uintptr_t)anno_obj->fields[0].i;
+            const char *elem_name = target->name;
+            for (uint32_t ei = 0; ei < entry->element_count; ei++) {
+                if (entry->elements[ei].name && strcmp(entry->elements[ei].name, elem_name) == 0) {
+                    const DxAnnotationElement *elem = &entry->elements[ei];
+                    switch (elem->val_type) {
+                        case DX_ANNO_VAL_STRING: {
+                            DxObject *str = dx_vm_create_string(vm, elem->str_value ? elem->str_value : "");
+                            frame->result = str ? DX_OBJ_VALUE(str) : DX_NULL_VALUE;
+                            break;
+                        }
+                        case DX_ANNO_VAL_BYTE: case DX_ANNO_VAL_SHORT: case DX_ANNO_VAL_CHAR:
+                        case DX_ANNO_VAL_INT: case DX_ANNO_VAL_BOOLEAN:
+                            frame->result = DX_INT_VALUE(elem->i_value);
+                            break;
+                        case DX_ANNO_VAL_LONG:
+                            frame->result = (DxValue){.tag = DX_VAL_LONG, .l = elem->l_value};
+                            break;
+                        case DX_ANNO_VAL_FLOAT:
+                            frame->result = (DxValue){.tag = DX_VAL_FLOAT, .f = elem->f_value};
+                            break;
+                        case DX_ANNO_VAL_DOUBLE:
+                            frame->result = (DxValue){.tag = DX_VAL_DOUBLE, .d = elem->d_value};
+                            break;
+                        case DX_ANNO_VAL_TYPE:
+                        case DX_ANNO_VAL_ENUM: {
+                            DxObject *str = dx_vm_create_string(vm, elem->str_value ? elem->str_value : "");
+                            frame->result = str ? DX_OBJ_VALUE(str) : DX_NULL_VALUE;
+                            break;
+                        }
+                        default:
+                            frame->result = DX_NULL_VALUE;
+                            break;
+                    }
+                    frame->has_result = true;
+                    return DX_OK;
+                }
+            }
+        }
+        if (strcmp(target->name, "annotationType") == 0) {
+            DxClass *class_cls = dx_vm_find_class(vm, "Ljava/lang/Class;");
+            if (class_cls) {
+                DxObject *cls_obj = dx_vm_alloc_object(vm, class_cls);
+                if (cls_obj && cls_obj->fields && class_cls->instance_field_count > 0) {
+                    cls_obj->fields[0].tag = DX_VAL_INT;
+                    cls_obj->fields[0].i = (int32_t)(uintptr_t)anno_obj->klass;
+                }
+                frame->result = cls_obj ? DX_OBJ_VALUE(cls_obj) : DX_NULL_VALUE;
+            } else {
+                frame->result = DX_NULL_VALUE;
+            }
+            frame->has_result = true;
+            return DX_OK;
+        }
+    }
+
     DxValue call_result;
     memset(&call_result, 0, sizeof(call_result));
     DxResult res = dx_vm_execute_method(vm, target, call_args, clamped_argc, &call_result);
@@ -667,6 +824,12 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                                uint32_t arg_count, DxValue *result) {
     if (!vm || !method) return DX_ERR_NULL_PTR;
 
+    // Start watchdog timer on top-level call (stack_depth == 0)
+    if (vm->watchdog_timeout_ms > 0 && vm->watchdog_start_time == 0) {
+        vm->watchdog_start_time = dx_current_time_ms();
+        vm->watchdog_triggered = false;
+    }
+
     // Check call depth BEFORE allocating stack frame to prevent stack overflow
     if (vm->stack_depth >= DX_MAX_STACK_DEPTH) {
         DX_ERROR(TAG, "Stack overflow at %s.%s (depth %u)",
@@ -796,6 +959,271 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
     // Macro for safe code access with bounds check
     #define CODE_AT(off) ((pc + (off)) < code_size ? code[pc + (off)] : 0)
 
+#if USE_COMPUTED_GOTO
+    // Threaded interpreter dispatch table - one entry per Dalvik opcode
+    static const void *dispatch_table[256] = {
+        [0x00] = &&op_0x00,
+        [0x01] = &&op_0x01,
+        [0x02] = &&op_0x02,
+        [0x03] = &&op_0x03,
+        [0x04] = &&op_0x04,
+        [0x05] = &&op_0x05,
+        [0x06] = &&op_0x06,
+        [0x07] = &&op_0x07,
+        [0x08] = &&op_0x08,
+        [0x09] = &&op_0x09,
+        [0x0A] = &&op_0x0A,
+        [0x0B] = &&op_0x0B,
+        [0x0C] = &&op_0x0C,
+        [0x0D] = &&op_0x0D,
+        [0x0E] = &&op_0x0E,
+        [0x0F] = &&op_0x0F,
+        [0x10] = &&op_0x10,
+        [0x11] = &&op_0x11,
+        [0x12] = &&op_0x12,
+        [0x13] = &&op_0x13,
+        [0x14] = &&op_0x14,
+        [0x15] = &&op_0x15,
+        [0x16] = &&op_0x16,
+        [0x17] = &&op_0x17,
+        [0x18] = &&op_0x18,
+        [0x19] = &&op_0x19,
+        [0x1A] = &&op_0x1A,
+        [0x1B] = &&op_0x1B,
+        [0x1C] = &&op_0x1C,
+        [0x1D] = &&op_0x1D,
+        [0x1E] = &&op_0x1E,
+        [0x1F] = &&op_0x1F,
+        [0x20] = &&op_0x20,
+        [0x21] = &&op_0x21,
+        [0x22] = &&op_0x22,
+        [0x23] = &&op_0x23,
+        [0x24] = &&op_0x24,
+        [0x25] = &&op_0x25,
+        [0x26] = &&op_0x26,
+        [0x27] = &&op_0x27,
+        [0x28] = &&op_0x28,
+        [0x29] = &&op_0x29,
+        [0x2A] = &&op_0x2A,
+        [0x2B] = &&op_0x2B,
+        [0x2C] = &&op_0x2C,
+        [0x2D] = &&op_0x2D,
+        [0x2E] = &&op_0x2E,
+        [0x2F] = &&op_0x2F,
+        [0x30] = &&op_0x30,
+        [0x31] = &&op_0x31,
+        [0x32] = &&op_0x32,
+        [0x33] = &&op_0x33,
+        [0x34] = &&op_0x34,
+        [0x35] = &&op_0x35,
+        [0x36] = &&op_0x36,
+        [0x37] = &&op_0x37,
+        [0x38] = &&op_0x38,
+        [0x39] = &&op_0x39,
+        [0x3A] = &&op_0x3A,
+        [0x3B] = &&op_0x3B,
+        [0x3C] = &&op_0x3C,
+        [0x3D] = &&op_0x3D,
+        [0x3E] = &&op_default,
+        [0x3F] = &&op_default,
+        [0x40] = &&op_default,
+        [0x41] = &&op_default,
+        [0x42] = &&op_default,
+        [0x43] = &&op_default,
+        [0x44] = &&op_0x44,
+        [0x45] = &&op_0x45,
+        [0x46] = &&op_0x46,
+        [0x47] = &&op_0x47,
+        [0x48] = &&op_0x48,
+        [0x49] = &&op_0x49,
+        [0x4A] = &&op_0x4A,
+        [0x4B] = &&op_0x4B,
+        [0x4C] = &&op_0x4C,
+        [0x4D] = &&op_0x4D,
+        [0x4E] = &&op_0x4E,
+        [0x4F] = &&op_0x4F,
+        [0x50] = &&op_0x50,
+        [0x51] = &&op_0x51,
+        [0x52] = &&op_0x52,
+        [0x53] = &&op_0x53,
+        [0x54] = &&op_0x54,
+        [0x55] = &&op_0x55,
+        [0x56] = &&op_0x56,
+        [0x57] = &&op_0x57,
+        [0x58] = &&op_0x58,
+        [0x59] = &&op_0x59,
+        [0x5A] = &&op_0x5A,
+        [0x5B] = &&op_0x5B,
+        [0x5C] = &&op_0x5C,
+        [0x5D] = &&op_0x5D,
+        [0x5E] = &&op_0x5E,
+        [0x5F] = &&op_0x5F,
+        [0x60] = &&op_0x60,
+        [0x61] = &&op_0x61,
+        [0x62] = &&op_0x62,
+        [0x63] = &&op_0x63,
+        [0x64] = &&op_0x64,
+        [0x65] = &&op_0x65,
+        [0x66] = &&op_0x66,
+        [0x67] = &&op_0x67,
+        [0x68] = &&op_0x68,
+        [0x69] = &&op_0x69,
+        [0x6A] = &&op_0x6A,
+        [0x6B] = &&op_0x6B,
+        [0x6C] = &&op_0x6C,
+        [0x6D] = &&op_0x6D,
+        [0x6E] = &&op_0x6E,
+        [0x6F] = &&op_0x6F,
+        [0x70] = &&op_0x70,
+        [0x71] = &&op_0x71,
+        [0x72] = &&op_0x72,
+        [0x73] = &&op_default,
+        [0x74] = &&op_0x74,
+        [0x75] = &&op_0x75,
+        [0x76] = &&op_0x76,
+        [0x77] = &&op_0x77,
+        [0x78] = &&op_0x78,
+        [0x79] = &&op_default,
+        [0x7A] = &&op_default,
+        [0x7B] = &&op_0x7B,
+        [0x7C] = &&op_0x7C,
+        [0x7D] = &&op_0x7D,
+        [0x7E] = &&op_0x7E,
+        [0x7F] = &&op_0x7F,
+        [0x80] = &&op_0x80,
+        [0x81] = &&op_0x81,
+        [0x82] = &&op_0x82,
+        [0x83] = &&op_0x83,
+        [0x84] = &&op_0x84,
+        [0x85] = &&op_0x85,
+        [0x86] = &&op_0x86,
+        [0x87] = &&op_0x87,
+        [0x88] = &&op_0x88,
+        [0x89] = &&op_0x89,
+        [0x8A] = &&op_0x8A,
+        [0x8B] = &&op_0x8B,
+        [0x8C] = &&op_0x8C,
+        [0x8D] = &&op_0x8D,
+        [0x8E] = &&op_0x8E,
+        [0x8F] = &&op_0x8F,
+        [0x90] = &&op_0x90,
+        [0x91] = &&op_0x91,
+        [0x92] = &&op_0x92,
+        [0x93] = &&op_0x93,
+        [0x94] = &&op_0x94,
+        [0x95] = &&op_0x95,
+        [0x96] = &&op_0x96,
+        [0x97] = &&op_0x97,
+        [0x98] = &&op_0x98,
+        [0x99] = &&op_0x99,
+        [0x9A] = &&op_0x9A,
+        [0x9B] = &&op_0x9B,
+        [0x9C] = &&op_0x9C,
+        [0x9D] = &&op_0x9D,
+        [0x9E] = &&op_0x9E,
+        [0x9F] = &&op_0x9F,
+        [0xA0] = &&op_0xA0,
+        [0xA1] = &&op_0xA1,
+        [0xA2] = &&op_0xA2,
+        [0xA3] = &&op_0xA3,
+        [0xA4] = &&op_0xA4,
+        [0xA5] = &&op_0xA5,
+        [0xA6] = &&op_0xA6,
+        [0xA7] = &&op_0xA7,
+        [0xA8] = &&op_0xA8,
+        [0xA9] = &&op_0xA9,
+        [0xAA] = &&op_0xAA,
+        [0xAB] = &&op_0xAB,
+        [0xAC] = &&op_0xAC,
+        [0xAD] = &&op_0xAD,
+        [0xAE] = &&op_0xAE,
+        [0xAF] = &&op_0xAF,
+        [0xB0] = &&op_0xB0,
+        [0xB1] = &&op_0xB1,
+        [0xB2] = &&op_0xB2,
+        [0xB3] = &&op_0xB3,
+        [0xB4] = &&op_0xB4,
+        [0xB5] = &&op_0xB5,
+        [0xB6] = &&op_0xB6,
+        [0xB7] = &&op_0xB7,
+        [0xB8] = &&op_0xB8,
+        [0xB9] = &&op_0xB9,
+        [0xBA] = &&op_0xBA,
+        [0xBB] = &&op_0xBB,
+        [0xBC] = &&op_0xBC,
+        [0xBD] = &&op_0xBD,
+        [0xBE] = &&op_0xBE,
+        [0xBF] = &&op_0xBF,
+        [0xC0] = &&op_0xC0,
+        [0xC1] = &&op_0xC1,
+        [0xC2] = &&op_0xC2,
+        [0xC3] = &&op_0xC3,
+        [0xC4] = &&op_0xC4,
+        [0xC5] = &&op_0xC5,
+        [0xC6] = &&op_0xC6,
+        [0xC7] = &&op_0xC7,
+        [0xC8] = &&op_0xC8,
+        [0xC9] = &&op_0xC9,
+        [0xCA] = &&op_0xCA,
+        [0xCB] = &&op_0xCB,
+        [0xCC] = &&op_0xCC,
+        [0xCD] = &&op_0xCD,
+        [0xCE] = &&op_0xCE,
+        [0xCF] = &&op_0xCF,
+        [0xD0] = &&op_0xD0,
+        [0xD1] = &&op_0xD1,
+        [0xD2] = &&op_0xD2,
+        [0xD3] = &&op_0xD3,
+        [0xD4] = &&op_0xD4,
+        [0xD5] = &&op_0xD5,
+        [0xD6] = &&op_0xD6,
+        [0xD7] = &&op_0xD7,
+        [0xD8] = &&op_0xD8,
+        [0xD9] = &&op_0xD9,
+        [0xDA] = &&op_0xDA,
+        [0xDB] = &&op_0xDB,
+        [0xDC] = &&op_0xDC,
+        [0xDD] = &&op_0xDD,
+        [0xDE] = &&op_0xDE,
+        [0xDF] = &&op_0xDF,
+        [0xE0] = &&op_0xE0,
+        [0xE1] = &&op_0xE1,
+        [0xE2] = &&op_0xE2,
+        [0xE3] = &&op_default,
+        [0xE4] = &&op_default,
+        [0xE5] = &&op_default,
+        [0xE6] = &&op_default,
+        [0xE7] = &&op_default,
+        [0xE8] = &&op_default,
+        [0xE9] = &&op_default,
+        [0xEA] = &&op_default,
+        [0xEB] = &&op_default,
+        [0xEC] = &&op_default,
+        [0xED] = &&op_default,
+        [0xEE] = &&op_default,
+        [0xEF] = &&op_default,
+        [0xF0] = &&op_default,
+        [0xF1] = &&op_default,
+        [0xF2] = &&op_default,
+        [0xF3] = &&op_default,
+        [0xF4] = &&op_default,
+        [0xF5] = &&op_default,
+        [0xF6] = &&op_default,
+        [0xF7] = &&op_default,
+        [0xF8] = &&op_default,
+        [0xF9] = &&op_default,
+        [0xFA] = &&op_0xFA,
+        [0xFB] = &&op_0xFB,
+        [0xFC] = &&op_0xFC,
+        [0xFD] = &&op_0xFD,
+        [0xFE] = &&op_0xFE,
+        [0xFF] = &&op_0xFF
+    };
+    #define DISPATCH_NEXT goto next_instruction
+#else
+    #define DISPATCH_NEXT break
+#endif
+
     while (pc < code_size) {
         next_instruction: (void)0;
         // Enforce global instruction limit to prevent runaway execution
@@ -843,50 +1271,78 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 
         DX_TRACE(TAG, "  pc=%u op=0x%02x (%s)", pc, opcode, dx_opcode_name(opcode));
 
+#if USE_COMPUTED_GOTO
+        goto *dispatch_table[opcode];
+#else
         switch (opcode) {
+#endif
 
+#if USE_COMPUTED_GOTO
+        op_0x00: // nop
+#else
         case 0x00: // nop
+#endif
             pc += 1;
-            break;
+            DISPATCH_NEXT;
 
+#if USE_COMPUTED_GOTO
+        op_0x01: { // move vA, vB (12x)
+#else
         case 0x01: { // move vA, vB (12x)
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             CHECK_REG(dst); CHECK_REG(src);
             frame->registers[dst] = frame->registers[src];
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x02: { // move/from16 vAA, vBBBB (22x)
+#else
         case 0x02: { // move/from16 vAA, vBBBB (22x)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             uint16_t src = code[pc + 1];
             if (src < DX_MAX_REGISTERS)
                 frame->registers[dst] = frame->registers[src];
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x03: { // move/16 vAAAA, vBBBB (32x)
+#else
         case 0x03: { // move/16 vAAAA, vBBBB (32x)
+#endif
             uint16_t dst = code[pc + 1];
             uint16_t src = code[pc + 2];
             if (dst < DX_MAX_REGISTERS && src < DX_MAX_REGISTERS)
                 frame->registers[dst] = frame->registers[src];
             pc += 3;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x04: { // move-wide vA, vB (12x) - treat as move for v1
+#else
         case 0x04: { // move-wide vA, vB (12x) - treat as move for v1
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst] = frame->registers[src];
             if (dst + 1 < DX_MAX_REGISTERS && src + 1 < DX_MAX_REGISTERS)
                 frame->registers[dst + 1] = frame->registers[src + 1];
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x05: { // move-wide/from16 vAA, vBBBB (22x)
+#else
         case 0x05: { // move-wide/from16 vAA, vBBBB (22x)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             uint16_t src = code[pc + 1];
             if (src < DX_MAX_REGISTERS) {
@@ -895,10 +1351,14 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                     frame->registers[dst + 1] = frame->registers[src + 1];
             }
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x06: { // move-wide/16 vAAAA, vBBBB (32x)
+#else
         case 0x06: { // move-wide/16 vAAAA, vBBBB (32x)
+#endif
             uint16_t dst = code[pc + 1];
             uint16_t src = code[pc + 2];
             if (dst < DX_MAX_REGISTERS && src < DX_MAX_REGISTERS) {
@@ -907,58 +1367,86 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                     frame->registers[dst + 1] = frame->registers[src + 1];
             }
             pc += 3;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x07: { // move-object vA, vB (12x)
+#else
         case 0x07: { // move-object vA, vB (12x)
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             CHECK_REG(dst); CHECK_REG(src);
             frame->registers[dst] = frame->registers[src];
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x08: { // move-object/from16 vAA, vBBBB (22x)
+#else
         case 0x08: { // move-object/from16 vAA, vBBBB (22x)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             uint16_t src = code[pc + 1];
             if (src < DX_MAX_REGISTERS)
                 frame->registers[dst] = frame->registers[src];
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x09: { // move-object/16 vAAAA, vBBBB (32x)
+#else
         case 0x09: { // move-object/16 vAAAA, vBBBB (32x)
+#endif
             uint16_t dst = code[pc + 1];
             uint16_t src = code[pc + 2];
             if (dst < DX_MAX_REGISTERS && src < DX_MAX_REGISTERS)
                 frame->registers[dst] = frame->registers[src];
             pc += 3;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x0A: { // move-result vAA (11x)
+#else
         case 0x0A: { // move-result vAA (11x)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             frame->registers[dst] = frame->result;
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x0B: { // move-result-wide vAA (11x)
+#else
         case 0x0B: { // move-result-wide vAA (11x)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             frame->registers[dst] = frame->result;
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x0C: { // move-result-object vAA (11x)
+#else
         case 0x0C: { // move-result-object vAA (11x)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             frame->registers[dst] = frame->result;
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x0D: { // move-exception vAA (11x)
+#else
         case 0x0D: { // move-exception vAA (11x)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             if (frame->exception) {
                 frame->registers[dst] = DX_OBJ_VALUE(frame->exception);
@@ -967,10 +1455,14 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 frame->registers[dst] = DX_NULL_VALUE;
             }
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x0E: { // return-void
+#else
         case 0x0E: { // return-void
+#endif
             // Check for finally (catch-all) blocks covering this return
             if (method->code.tries_size > 0) {
                 uint32_t finally_addr = find_finally_handler(code, code_size,
@@ -979,13 +1471,17 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                     DX_DEBUG(TAG, "return-void inside try-finally, running finally at %u", finally_addr);
                     frame->exception = NULL; // no exception on normal return
                     pc = finally_addr;
-                    break;
+                    DISPATCH_NEXT;
                 }
             }
             goto done;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x0F: { // return vAA
+#else
         case 0x0F: { // return vAA
+#endif
             uint8_t src = (inst >> 8) & 0xFF;
             frame->result = frame->registers[src];
             frame->has_result = true;
@@ -998,13 +1494,17 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                     DX_DEBUG(TAG, "return inside try-finally, running finally at %u", finally_addr);
                     frame->exception = NULL;
                     pc = finally_addr;
-                    break;
+                    DISPATCH_NEXT;
                 }
             }
             goto done;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x10: { // return-wide vAA
+#else
         case 0x10: { // return-wide vAA
+#endif
             uint8_t src = (inst >> 8) & 0xFF;
             frame->result = frame->registers[src];
             frame->has_result = true;
@@ -1016,13 +1516,17 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                     DX_DEBUG(TAG, "return-wide inside try-finally, running finally at %u", finally_addr);
                     frame->exception = NULL;
                     pc = finally_addr;
-                    break;
+                    DISPATCH_NEXT;
                 }
             }
             goto done;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x11: { // return-object vAA
+#else
         case 0x11: { // return-object vAA
+#endif
             uint8_t src = (inst >> 8) & 0xFF;
             frame->result = frame->registers[src];
             frame->has_result = true;
@@ -1034,64 +1538,92 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                     DX_DEBUG(TAG, "return-object inside try-finally, running finally at %u", finally_addr);
                     frame->exception = NULL;
                     pc = finally_addr;
-                    break;
+                    DISPATCH_NEXT;
                 }
             }
             goto done;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x12: { // const/4 vA, #+B (11n)
+#else
         case 0x12: { // const/4 vA, #+B (11n)
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             int32_t val = (int32_t)(inst >> 12);
             if (val & 0x8) val |= (int32_t)0xFFFFFFF0;
             frame->registers[dst] = DX_INT_VALUE(val);
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x13: { // const/16 vAA, #+BBBB (21s)
+#else
         case 0x13: { // const/16 vAA, #+BBBB (21s)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             int16_t val = (int16_t)code[pc + 1];
             frame->registers[dst] = DX_INT_VALUE((int32_t)val);
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x14: { // const vAA, #+BBBBBBBB (31i)
+#else
         case 0x14: { // const vAA, #+BBBBBBBB (31i)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             int32_t val = (int32_t)(code[pc + 1] | ((uint32_t)code[pc + 2] << 16));
             frame->registers[dst] = DX_INT_VALUE(val);
             pc += 3;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x15: { // const/high16 vAA, #+BBBB0000 (21h)
+#else
         case 0x15: { // const/high16 vAA, #+BBBB0000 (21h)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             int32_t val = (int32_t)((uint32_t)code[pc + 1] << 16);
             frame->registers[dst] = DX_INT_VALUE(val);
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x16: { // const-wide/16 vAA, #+BBBB (21s)
+#else
         case 0x16: { // const-wide/16 vAA, #+BBBB (21s)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             int64_t val = (int16_t)code[pc + 1];
             frame->registers[dst].tag = DX_VAL_LONG;
             frame->registers[dst].l = val;
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x17: { // const-wide/32 vAA, #+BBBBBBBB (31i)
+#else
         case 0x17: { // const-wide/32 vAA, #+BBBBBBBB (31i)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             int32_t val = (int32_t)(code[pc + 1] | ((uint32_t)code[pc + 2] << 16));
             frame->registers[dst].tag = DX_VAL_LONG;
             frame->registers[dst].l = (int64_t)val;
             pc += 3;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x18: { // const-wide vAA, #+BBBBBBBBBBBBBBBB (51l)
+#else
         case 0x18: { // const-wide vAA, #+BBBBBBBBBBBBBBBB (51l)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             int64_t val = (int64_t)code[pc + 1] |
                           ((int64_t)code[pc + 2] << 16) |
@@ -1100,55 +1632,83 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             frame->registers[dst].tag = DX_VAL_LONG;
             frame->registers[dst].l = val;
             pc += 5;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x19: { // const-wide/high16 vAA, #+BBBB000000000000 (21h)
+#else
         case 0x19: { // const-wide/high16 vAA, #+BBBB000000000000 (21h)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             int64_t val = (int64_t)((uint64_t)code[pc + 1] << 48);
             frame->registers[dst].tag = DX_VAL_LONG;
             frame->registers[dst].l = val;
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x1A: { // const-string vAA, string@BBBB (21c)
+#else
         case 0x1A: { // const-string vAA, string@BBBB (21c)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             uint16_t str_idx = code[pc + 1];
             const char *str = dx_dex_get_string(cur_dex, str_idx);
             DxObject *str_obj = dx_vm_create_string(vm, str ? str : "");
             frame->registers[dst] = DX_OBJ_VALUE(str_obj);
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x1B: { // const-string/jumbo vAA, string@BBBBBBBB (31c)
+#else
         case 0x1B: { // const-string/jumbo vAA, string@BBBBBBBB (31c)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             uint32_t str_idx = code[pc + 1] | ((uint32_t)code[pc + 2] << 16);
             const char *str = dx_dex_get_string(cur_dex, str_idx);
             DxObject *str_obj = dx_vm_create_string(vm, str ? str : "");
             frame->registers[dst] = DX_OBJ_VALUE(str_obj);
             pc += 3;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x1C: { // const-class vAA, type@BBBB (21c)
+#else
         case 0x1C: { // const-class vAA, type@BBBB (21c)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             // Return null for class objects - proper Class<T> not modeled
             frame->registers[dst] = DX_NULL_VALUE;
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x1D: // monitor-enter (11x) - no threading model
+#else
         case 0x1D: // monitor-enter (11x) - no threading model
+#endif
             pc += 1;
-            break;
+            DISPATCH_NEXT;
 
+#if USE_COMPUTED_GOTO
+        op_0x1E: // monitor-exit (11x) - no threading model
+#else
         case 0x1E: // monitor-exit (11x) - no threading model
+#endif
             pc += 1;
-            break;
+            DISPATCH_NEXT;
 
+#if USE_COMPUTED_GOTO
+        op_0x1F: { // check-cast vAA, type@BBBB (21c)
+#else
         case 0x1F: { // check-cast vAA, type@BBBB (21c)
+#endif
             uint8_t src = (inst >> 8) & 0xFF;
             uint16_t type_idx = code[pc + 1];
             DxObject *obj = (frame->registers[src].tag == DX_VAL_OBJ) ? frame->registers[src].obj : NULL;
@@ -1194,10 +1754,14 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             }
             // null passes check-cast (Java spec)
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x20: { // instance-of vA, vB, type@CCCC (22c)
+#else
         case 0x20: { // instance-of vA, vB, type@CCCC (22c)
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t obj_reg = (inst >> 12) & 0x0F;
             uint16_t type_idx = code[pc + 1];
@@ -1228,10 +1792,14 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 frame->registers[dst] = DX_INT_VALUE(match ? 1 : 0);
             }
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x21: { // array-length vA, vB (12x)
+#else
         case 0x21: { // array-length vA, vB (12x)
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             DxObject *arr = frame->registers[src].obj;
@@ -1241,10 +1809,14 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 frame->registers[dst] = DX_INT_VALUE(0);
             }
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x22: { // new-instance vAA, type@BBBB (21c)
+#else
         case 0x22: { // new-instance vAA, type@BBBB (21c)
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             uint16_t type_idx = code[pc + 1];
             const char *type_desc = dx_dex_get_type(cur_dex, type_idx);
@@ -1265,10 +1837,14 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 
             frame->registers[dst] = DX_OBJ_VALUE(obj);
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x23: { // new-array vA, vB, type@CCCC (22c)
+#else
         case 0x23: { // new-array vA, vB, type@CCCC (22c)
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t size_reg = (inst >> 12) & 0x0F;
             int32_t length = frame->registers[size_reg].i;
@@ -1280,10 +1856,14 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 frame->registers[dst] = DX_NULL_VALUE;
             }
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x24: { // filled-new-array {vC, vD, vE, vF, vG}, type@BBBB (35c)
+#else
         case 0x24: { // filled-new-array {vC, vD, vE, vF, vG}, type@BBBB (35c)
+#endif
             uint8_t argc;
             uint8_t arg_regs[5];
             decode_35c_args(code, pc, &argc, arg_regs);
@@ -1298,10 +1878,14 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             }
             frame->has_result = true;
             pc += 3;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x25: { // filled-new-array/range {vCCCC .. vNNNN}, type@BBBB (3rc)
+#else
         case 0x25: { // filled-new-array/range {vCCCC .. vNNNN}, type@BBBB (3rc)
+#endif
             uint8_t argc = (inst >> 8) & 0xFF;
             uint16_t first_reg = code[pc + 2];
             DxObject *arr = dx_vm_alloc_array(vm, argc);
@@ -1318,10 +1902,14 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             }
             frame->has_result = true;
             pc += 3;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x26: { // fill-array-data vAA, +BBBBBBBB (31t)
+#else
         case 0x26: { // fill-array-data vAA, +BBBBBBBB (31t)
+#endif
             uint8_t arr_reg = (inst >> 8) & 0xFF;
             int32_t offset = (int32_t)(code[pc + 1] | ((uint32_t)code[pc + 2] << 16));
             const uint16_t *payload = &code[pc + offset];
@@ -1329,7 +1917,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             if (ident != 0x0300) {
                 DX_WARN(TAG, "fill-array-data: bad ident 0x%04x at pc=%u", ident, pc);
                 pc += 3;
-                break;
+                DISPATCH_NEXT;
             }
             uint16_t elem_width = payload[1];
             uint32_t size = (uint32_t)payload[2] | ((uint32_t)payload[3] << 16);
@@ -1362,10 +1950,14 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 }
             }
             pc += 3;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x27: { // throw vAA (11x)
+#else
         case 0x27: { // throw vAA (11x)
+#endif
             uint8_t src = (inst >> 8) & 0xFF;
             DxObject *exc = (frame->registers[src].tag == DX_VAL_OBJ) ? frame->registers[src].obj : NULL;
             const char *exc_class = exc && exc->klass ? exc->klass->descriptor : "unknown";
@@ -1377,7 +1969,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 if (handler_addr != UINT32_MAX) {
                     DX_INFO(TAG, "throw %s -> caught at handler addr %u", exc_class, handler_addr);
                     pc = handler_addr;
-                    break;
+                    DISPATCH_NEXT;
                 }
             }
 
@@ -1388,39 +1980,55 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             goto done;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x28: { // goto +AA (10t)
+#else
         case 0x28: { // goto +AA (10t)
+#endif
             int8_t offset = (int8_t)((inst >> 8) & 0xFF);
             pc += offset;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x29: { // goto/16 +AAAA (20t)
+#else
         case 0x29: { // goto/16 +AAAA (20t)
+#endif
             int16_t offset = (int16_t)code[pc + 1];
             pc += offset;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x2A: { // goto/32 +AAAAAAAA (30t)
+#else
         case 0x2A: { // goto/32 +AAAAAAAA (30t)
+#endif
             int32_t offset = (int32_t)(code[pc + 1] | ((uint32_t)code[pc + 2] << 16));
             pc += offset;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x2B: { // packed-switch vAA, +BBBBBBBB (31t)
+#else
         case 0x2B: { // packed-switch vAA, +BBBBBBBB (31t)
+#endif
             uint8_t test_reg = (inst >> 8) & 0xFF;
             int32_t offset = (int32_t)(code[pc + 1] | ((uint32_t)code[pc + 2] << 16));
             uint32_t payload_pc = pc + offset;
             if (payload_pc >= code_size) {
                 DX_WARN(TAG, "packed-switch: payload offset %u out of bounds (code_size=%u)", payload_pc, code_size);
                 pc += 3;
-                break;
+                DISPATCH_NEXT;
             }
             const uint16_t *payload = &code[payload_pc];
             uint16_t ident = payload[0];
             if (ident != 0x0100) {
                 DX_WARN(TAG, "packed-switch: bad ident 0x%04x at pc=%u", ident, pc);
                 pc += 3;
-                break;
+                DISPATCH_NEXT;
             }
             uint16_t size = payload[1];
             int32_t first_key = (int32_t)(payload[2] | ((uint32_t)payload[3] << 16));
@@ -1433,24 +2041,28 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             } else {
                 pc += 3; // fall through
             }
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_0x2C: { // sparse-switch vAA, +BBBBBBBB (31t)
+#else
         case 0x2C: { // sparse-switch vAA, +BBBBBBBB (31t)
+#endif
             uint8_t test_reg = (inst >> 8) & 0xFF;
             int32_t offset = (int32_t)(code[pc + 1] | ((uint32_t)code[pc + 2] << 16));
             uint32_t payload_pc = pc + offset;
             if (payload_pc >= code_size) {
                 DX_WARN(TAG, "sparse-switch: payload offset %u out of bounds (code_size=%u)", payload_pc, code_size);
                 pc += 3;
-                break;
+                DISPATCH_NEXT;
             }
             const uint16_t *payload = &code[payload_pc];
             uint16_t ident = payload[0];
             if (ident != 0x0200) {
                 DX_WARN(TAG, "sparse-switch: bad ident 0x%04x at pc=%u", ident, pc);
                 pc += 3;
-                break;
+                DISPATCH_NEXT;
             }
             uint16_t size = payload[1];
             const int32_t *keys = (const int32_t *)&payload[2];
@@ -1468,11 +2080,15 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             if (!found) {
                 pc += 3; // fall through
             }
-            break;
+            DISPATCH_NEXT;
         }
 
         // Comparison operations (23x)
+#if USE_COMPUTED_GOTO
+        op_0x2D: { // cmpl-float vAA, vBB, vCC
+#else
         case 0x2D: { // cmpl-float vAA, vBB, vCC
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             uint8_t b = code[pc + 1] & 0xFF;
             uint8_t c = (code[pc + 1] >> 8) & 0xFF;
@@ -1480,9 +2096,13 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             float fc = frame->registers[c].f;
             frame->registers[dst] = DX_INT_VALUE(fb < fc ? -1 : (fb > fc ? 1 : 0));
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x2E: { // cmpg-float
+#else
         case 0x2E: { // cmpg-float
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             uint8_t b = code[pc + 1] & 0xFF;
             uint8_t c = (code[pc + 1] >> 8) & 0xFF;
@@ -1490,9 +2110,13 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             float fc = frame->registers[c].f;
             frame->registers[dst] = DX_INT_VALUE(fb > fc ? 1 : (fb < fc ? -1 : 0));
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x2F: { // cmpl-double
+#else
         case 0x2F: { // cmpl-double
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             uint8_t b = code[pc + 1] & 0xFF;
             uint8_t c = (code[pc + 1] >> 8) & 0xFF;
@@ -1500,9 +2124,13 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             double dc = frame->registers[c].d;
             frame->registers[dst] = DX_INT_VALUE(db < dc ? -1 : (db > dc ? 1 : 0));
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x30: { // cmpg-double
+#else
         case 0x30: { // cmpg-double
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             uint8_t b = code[pc + 1] & 0xFF;
             uint8_t c = (code[pc + 1] >> 8) & 0xFF;
@@ -1510,9 +2138,13 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             double dc = frame->registers[c].d;
             frame->registers[dst] = DX_INT_VALUE(db > dc ? 1 : (db < dc ? -1 : 0));
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x31: { // cmp-long
+#else
         case 0x31: { // cmp-long
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             uint8_t b = code[pc + 1] & 0xFF;
             uint8_t c = (code[pc + 1] >> 8) & 0xFF;
@@ -1520,11 +2152,20 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             int64_t lc = frame->registers[c].l;
             frame->registers[dst] = DX_INT_VALUE(lb < lc ? -1 : (lb > lc ? 1 : 0));
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
         // if-test vA, vB, +CCCC (22t)
+#if USE_COMPUTED_GOTO
+        op_0x32:
+        op_0x33:
+        op_0x34:
+        op_0x35:
+        op_0x36:
+        op_0x37: {
+#else
         case 0x32: case 0x33: case 0x34: case 0x35: case 0x36: case 0x37: {
+#endif
             uint8_t a = (inst >> 8) & 0x0F;
             uint8_t b = (inst >> 12) & 0x0F;
             int16_t offset = (int16_t)code[pc + 1];
@@ -1540,11 +2181,20 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 case 0x37: take = (va <= vb); break; // if-le
             }
             pc += take ? offset : 2;
-            break;
+            DISPATCH_NEXT;
         }
 
         // if-testz vAA, +BBBB (21t)
+#if USE_COMPUTED_GOTO
+        op_0x38:
+        op_0x39:
+        op_0x3A:
+        op_0x3B:
+        op_0x3C:
+        op_0x3D: {
+#else
         case 0x38: case 0x39: case 0x3A: case 0x3B: case 0x3C: case 0x3D: {
+#endif
             uint8_t src = (inst >> 8) & 0xFF;
             int16_t offset = (int16_t)code[pc + 1];
             int32_t val;
@@ -1563,12 +2213,25 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 case 0x3D: take = (val <= 0); break; // if-lez
             }
             pc += take ? offset : 2;
-            break;
+            DISPATCH_NEXT;
         }
 
         // aget variants (23x): aget vAA, vBB, vCC
+#if USE_COMPUTED_GOTO
+        op_0x44:
+        op_0x45:
+        op_0x46:
+        op_0x47:
+#else
         case 0x44: case 0x45: case 0x46: case 0x47:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0x48:
+        op_0x49:
+        op_0x4A: {
+#else
         case 0x48: case 0x49: case 0x4A: {
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             uint8_t arr_reg = code[pc + 1] & 0xFF;
             uint8_t idx_reg = (code[pc + 1] >> 8) & 0xFF;
@@ -1605,11 +2268,24 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 frame->registers[dst] = (opcode == 0x46) ? DX_NULL_VALUE : DX_INT_VALUE(0);
             }
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
         // aput variants (23x): aput vAA, vBB, vCC
+#if USE_COMPUTED_GOTO
+        op_0x4B:
+        op_0x4C:
+        op_0x4D:
+        op_0x4E:
+#else
         case 0x4B: case 0x4C: case 0x4D: case 0x4E:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0x4F:
+        op_0x50:
+        op_0x51: {
+#else
         case 0x4F: case 0x50: case 0x51: {
+#endif
             uint8_t src = (inst >> 8) & 0xFF;
             uint8_t arr_reg = code[pc + 1] & 0xFF;
             uint8_t idx_reg = (code[pc + 1] >> 8) & 0xFF;
@@ -1640,12 +2316,25 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 if (exc) { vm->pending_exception = exc; exec_result = DX_ERR_EXCEPTION; goto done; }
             }
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
         // iget family (22c)
+#if USE_COMPUTED_GOTO
+        op_0x52:
+        op_0x53:
+        op_0x54:
+        op_0x55:
+#else
         case 0x52: case 0x53: case 0x54: case 0x55:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0x56:
+        op_0x57:
+        op_0x58: {
+#else
         case 0x56: case 0x57: case 0x58: {
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t obj_reg = (inst >> 12) & 0x0F;
             uint16_t field_idx = code[pc + 1];
@@ -1683,7 +2372,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 }
                 frame->registers[dst] = (opcode == 0x54) ? DX_NULL_VALUE : DX_INT_VALUE(0);
                 pc += 2;
-                break;
+                DISPATCH_NEXT;
             }
 
             const char *fname = dx_dex_get_field_name(cur_dex, field_idx);
@@ -1695,12 +2384,25 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 frame->registers[dst] = (opcode == 0x54) ? DX_NULL_VALUE : DX_INT_VALUE(0);
             }
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
         // iput family (22c)
+#if USE_COMPUTED_GOTO
+        op_0x59:
+        op_0x5A:
+        op_0x5B:
+        op_0x5C:
+#else
         case 0x59: case 0x5A: case 0x5B: case 0x5C:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0x5D:
+        op_0x5E:
+        op_0x5F: {
+#else
         case 0x5D: case 0x5E: case 0x5F: {
+#endif
             uint8_t src = (inst >> 8) & 0x0F;
             uint8_t obj_reg = (inst >> 12) & 0x0F;
             uint16_t field_idx = code[pc + 1];
@@ -1722,39 +2424,73 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                     goto done;
                 }
                 pc += 2;
-                break;
+                DISPATCH_NEXT;
             }
 
             const char *fname = dx_dex_get_field_name(cur_dex, field_idx);
             dx_vm_set_field(obj, fname, frame->registers[src]);
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
         // sget family (21c)
+#if USE_COMPUTED_GOTO
+        op_0x60:
+        op_0x61:
+        op_0x62:
+        op_0x63:
+#else
         case 0x60: case 0x61: case 0x62: case 0x63:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0x64:
+        op_0x65:
+        op_0x66: {
+#else
         case 0x64: case 0x65: case 0x66: {
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             uint16_t field_idx = code[pc + 1];
             bool is_obj = (opcode == 0x62);
             handle_sget(vm, frame, dst, field_idx, is_obj);
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
         // sput family (21c)
+#if USE_COMPUTED_GOTO
+        op_0x67:
+        op_0x68:
+        op_0x69:
+        op_0x6A:
+#else
         case 0x67: case 0x68: case 0x69: case 0x6A:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0x6B:
+        op_0x6C:
+        op_0x6D: {
+#else
         case 0x6B: case 0x6C: case 0x6D: {
+#endif
             uint8_t src = (inst >> 8) & 0xFF;
             uint16_t field_idx = code[pc + 1];
             bool is_obj = (opcode == 0x69);
             handle_sput(vm, frame, src, field_idx, is_obj);
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
         // invoke-kind (35c)
+#if USE_COMPUTED_GOTO
+        op_0x6E:
+        op_0x6F:
+        op_0x70:
+        op_0x71:
+        op_0x72: {
+#else
         case 0x6E: case 0x6F: case 0x70: case 0x71: case 0x72: {
+#endif
             frame->pc = 0; // sentinel
             exec_result = handle_invoke(vm, frame, code, pc, opcode);
             if (exec_result != DX_OK) goto done;
@@ -1765,11 +2501,19 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             } else {
                 pc += 3;
             }
-            break;
+            DISPATCH_NEXT;
         }
 
         // invoke-kind/range (3rc)
+#if USE_COMPUTED_GOTO
+        op_0x74:
+        op_0x75:
+        op_0x76:
+        op_0x77:
+        op_0x78: {
+#else
         case 0x74: case 0x75: case 0x76: case 0x77: case 0x78: {
+#endif
             frame->pc = 0; // sentinel
             exec_result = handle_invoke_range(vm, frame, code, pc, opcode);
             if (exec_result != DX_OK) goto done;
@@ -1779,180 +2523,320 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             } else {
                 pc += 3;
             }
-            break;
+            DISPATCH_NEXT;
         }
 
         // Unary operations (12x)
+#if USE_COMPUTED_GOTO
+        op_0x7B: { // neg-int vA, vB
+#else
         case 0x7B: { // neg-int vA, vB
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst] = DX_INT_VALUE(-frame->registers[src].i);
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x7C: { // not-int vA, vB
+#else
         case 0x7C: { // not-int vA, vB
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst] = DX_INT_VALUE(~frame->registers[src].i);
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x7D: { // neg-long
+#else
         case 0x7D: { // neg-long
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst].tag = DX_VAL_LONG;
             frame->registers[dst].l = -frame->registers[src].l;
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x7E: { // not-long
+#else
         case 0x7E: { // not-long
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst].tag = DX_VAL_LONG;
             frame->registers[dst].l = ~frame->registers[src].l;
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x7F: { // neg-float
+#else
         case 0x7F: { // neg-float
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst].tag = DX_VAL_FLOAT;
             frame->registers[dst].f = -frame->registers[src].f;
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x80: { // neg-double
+#else
         case 0x80: { // neg-double
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst].tag = DX_VAL_DOUBLE;
             frame->registers[dst].d = -frame->registers[src].d;
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x81: { // int-to-long
+#else
         case 0x81: { // int-to-long
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst].tag = DX_VAL_LONG;
             frame->registers[dst].l = (int64_t)frame->registers[src].i;
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x82: { // int-to-float
+#else
         case 0x82: { // int-to-float
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst].tag = DX_VAL_FLOAT;
             frame->registers[dst].f = (float)frame->registers[src].i;
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x83: { // int-to-double
+#else
         case 0x83: { // int-to-double
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst].tag = DX_VAL_DOUBLE;
             frame->registers[dst].d = (double)frame->registers[src].i;
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x84: { // long-to-int
+#else
         case 0x84: { // long-to-int
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst] = DX_INT_VALUE((int32_t)frame->registers[src].l);
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x85: { // long-to-float
+#else
         case 0x85: { // long-to-float
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst].tag = DX_VAL_FLOAT;
             frame->registers[dst].f = (float)frame->registers[src].l;
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x86: { // long-to-double
+#else
         case 0x86: { // long-to-double
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst].tag = DX_VAL_DOUBLE;
             frame->registers[dst].d = (double)frame->registers[src].l;
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x87: { // float-to-int
+#else
         case 0x87: { // float-to-int
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst] = DX_INT_VALUE((int32_t)frame->registers[src].f);
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x88: { // float-to-long
+#else
         case 0x88: { // float-to-long
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst].tag = DX_VAL_LONG;
             frame->registers[dst].l = (int64_t)frame->registers[src].f;
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x89: { // float-to-double
+#else
         case 0x89: { // float-to-double
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst].tag = DX_VAL_DOUBLE;
             frame->registers[dst].d = (double)frame->registers[src].f;
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x8A: { // double-to-int
+#else
         case 0x8A: { // double-to-int
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst] = DX_INT_VALUE((int32_t)frame->registers[src].d);
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x8B: { // double-to-long
+#else
         case 0x8B: { // double-to-long
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst].tag = DX_VAL_LONG;
             frame->registers[dst].l = (int64_t)frame->registers[src].d;
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x8C: { // double-to-float
+#else
         case 0x8C: { // double-to-float
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst].tag = DX_VAL_FLOAT;
             frame->registers[dst].f = (float)frame->registers[src].d;
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x8D: { // int-to-byte
+#else
         case 0x8D: { // int-to-byte
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst] = DX_INT_VALUE((int32_t)(int8_t)(frame->registers[src].i & 0xFF));
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x8E: { // int-to-char
+#else
         case 0x8E: { // int-to-char
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst] = DX_INT_VALUE((int32_t)(uint16_t)(frame->registers[src].i & 0xFFFF));
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
+#if USE_COMPUTED_GOTO
+        op_0x8F: { // int-to-short
+#else
         case 0x8F: { // int-to-short
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             frame->registers[dst] = DX_INT_VALUE((int32_t)(int16_t)(frame->registers[src].i & 0xFFFF));
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
 
         // Binary operations (23x): binop vAA, vBB, vCC
+#if USE_COMPUTED_GOTO
+        op_0x90:
+        op_0x91:
+        op_0x92:
+        op_0x93:
+#else
         case 0x90: case 0x91: case 0x92: case 0x93:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0x94:
+        op_0x95:
+        op_0x96:
+        op_0x97:
+#else
         case 0x94: case 0x95: case 0x96: case 0x97:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0x98:
+        op_0x99:
+        op_0x9A:
+        op_0x9B:
+#else
         case 0x98: case 0x99: case 0x9A: case 0x9B:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0x9C:
+        op_0x9D:
+        op_0x9E:
+        op_0x9F:
+#else
         case 0x9C: case 0x9D: case 0x9E: case 0x9F:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0xA0:
+        op_0xA1:
+        op_0xA2:
+        op_0xA3:
+#else
         case 0xA0: case 0xA1: case 0xA2: case 0xA3:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0xA4:
+        op_0xA5:
+        op_0xA6:
+        op_0xA7:
+#else
         case 0xA4: case 0xA5: case 0xA6: case 0xA7:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0xA8:
+        op_0xA9:
+        op_0xAA:
+        op_0xAB:
+#else
         case 0xA8: case 0xA9: case 0xAA: case 0xAB:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0xAC:
+        op_0xAD:
+        op_0xAE:
+        op_0xAF: {
+#else
         case 0xAC: case 0xAD: case 0xAE: case 0xAF: {
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             uint8_t b = code[pc + 1] & 0xFF;
             uint8_t c = (code[pc + 1] >> 8) & 0xFF;
@@ -2070,18 +2954,74 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             }
             if (use_int) frame->registers[dst] = DX_INT_VALUE(r);
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
         // Binary operations /2addr (12x): binop/2addr vA, vB
+#if USE_COMPUTED_GOTO
+        op_0xB0:
+        op_0xB1:
+        op_0xB2:
+        op_0xB3:
+#else
         case 0xB0: case 0xB1: case 0xB2: case 0xB3:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0xB4:
+        op_0xB5:
+        op_0xB6:
+        op_0xB7:
+#else
         case 0xB4: case 0xB5: case 0xB6: case 0xB7:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0xB8:
+        op_0xB9:
+        op_0xBA:
+        op_0xBB:
+#else
         case 0xB8: case 0xB9: case 0xBA: case 0xBB:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0xBC:
+        op_0xBD:
+        op_0xBE:
+        op_0xBF:
+#else
         case 0xBC: case 0xBD: case 0xBE: case 0xBF:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0xC0:
+        op_0xC1:
+        op_0xC2:
+        op_0xC3:
+#else
         case 0xC0: case 0xC1: case 0xC2: case 0xC3:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0xC4:
+        op_0xC5:
+        op_0xC6:
+        op_0xC7:
+#else
         case 0xC4: case 0xC5: case 0xC6: case 0xC7:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0xC8:
+        op_0xC9:
+        op_0xCA:
+        op_0xCB:
+#else
         case 0xC8: case 0xC9: case 0xCA: case 0xCB:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0xCC:
+        op_0xCD:
+        op_0xCE:
+        op_0xCF: {
+#else
         case 0xCC: case 0xCD: case 0xCE: case 0xCF: {
+#endif
             uint8_t a = (inst >> 8) & 0x0F;
             uint8_t b = (inst >> 12) & 0x0F;
             int32_t va = frame->registers[a].i;
@@ -2195,12 +3135,26 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             }
             if (use_int_2addr) frame->registers[a] = DX_INT_VALUE(r);
             pc += 1;
-            break;
+            DISPATCH_NEXT;
         }
 
         // binop/lit16 (22s): binop/lit16 vA, vB, #+CCCC
+#if USE_COMPUTED_GOTO
+        op_0xD0:
+        op_0xD1:
+        op_0xD2:
+        op_0xD3:
+#else
         case 0xD0: case 0xD1: case 0xD2: case 0xD3:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0xD4:
+        op_0xD5:
+        op_0xD6:
+        op_0xD7: {
+#else
         case 0xD4: case 0xD5: case 0xD6: case 0xD7: {
+#endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             int16_t lit = (int16_t)code[pc + 1];
@@ -2218,13 +3172,33 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             }
             frame->registers[dst] = DX_INT_VALUE(r);
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
         // binop/lit8 (22b): binop/lit8 vAA, vBB, #+CC
+#if USE_COMPUTED_GOTO
+        op_0xD8:
+        op_0xD9:
+        op_0xDA:
+        op_0xDB:
+#else
         case 0xD8: case 0xD9: case 0xDA: case 0xDB:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0xDC:
+        op_0xDD:
+        op_0xDE:
+        op_0xDF:
+#else
         case 0xDC: case 0xDD: case 0xDE: case 0xDF:
+#endif
+#if USE_COMPUTED_GOTO
+        op_0xE0:
+        op_0xE1:
+        op_0xE2: {
+#else
         case 0xE0: case 0xE1: case 0xE2: {
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             uint8_t src = code[pc + 1] & 0xFF;
             int8_t lit = (int8_t)((code[pc + 1] >> 8) & 0xFF);
@@ -2245,12 +3219,17 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             }
             frame->registers[dst] = DX_INT_VALUE(r);
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
         // invoke-polymorphic (45cc format, 4 code units)
         // invoke-polymorphic/range (4rcc format, 4 code units)
+#if USE_COMPUTED_GOTO
+        op_0xFA:
+        op_0xFB: {
+#else
         case 0xFA: case 0xFB: {
+#endif
             DX_WARN(TAG, "%s at pc=%u in %s.%s - not supported, returning null",
                      dx_opcode_name(opcode), pc,
                      method->declaring_class ? method->declaring_class->descriptor : "?",
@@ -2258,25 +3237,62 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             frame->result = DX_NULL_VALUE;
             frame->has_result = true;
             pc += 4;
-            break;
+            DISPATCH_NEXT;
         }
 
         // invoke-custom (35c format, 3 code units)
-        // invoke-custom/range (3rc format, 3 code units)
-        case 0xFC: case 0xFD: {
-            DX_WARN(TAG, "%s at pc=%u in %s.%s - not supported, returning null (most APKs desugar lambdas via R8)",
-                     dx_opcode_name(opcode), pc,
-                     method->declaring_class ? method->declaring_class->descriptor : "?",
-                     method->name);
-            frame->result = DX_NULL_VALUE;
-            frame->has_result = true;
+#if USE_COMPUTED_GOTO
+        op_0xFC: {
+#else
+        case 0xFC: {
+#endif
+            uint16_t call_site_idx = code[pc + 1];
+            uint8_t argc;
+            uint8_t arg_regs[5];
+            decode_35c_args(code, pc, &argc, arg_regs);
+
+            DxValue ic_args[5];
+            for (uint8_t ai = 0; ai < argc && ai < 5; ai++) {
+                ic_args[ai] = frame->registers[arg_regs[ai]];
+            }
+
+            exec_result = dx_vm_invoke_custom(vm, frame, call_site_idx, ic_args, argc);
+            if (exec_result != DX_OK) goto done;
             pc += 3;
-            break;
+            DISPATCH_NEXT;
+        }
+
+        // invoke-custom/range (3rc format, 3 code units)
+#if USE_COMPUTED_GOTO
+        op_0xFD: {
+#else
+        case 0xFD: {
+#endif
+            uint16_t call_site_idx = code[pc + 1];
+            uint8_t argc = (inst >> 8) & 0xFF;
+            uint16_t first_reg = code[pc + 2];
+
+            DxValue ic_args[DX_MAX_REGISTERS];
+            uint32_t actual_argc = argc;
+            if (actual_argc > DX_MAX_REGISTERS) actual_argc = DX_MAX_REGISTERS;
+            for (uint32_t ai = 0; ai < actual_argc; ai++) {
+                ic_args[ai] = frame->registers[first_reg + ai];
+            }
+
+            exec_result = dx_vm_invoke_custom(vm, frame, call_site_idx, ic_args, actual_argc);
+            if (exec_result != DX_OK) goto done;
+            pc += 3;
+            DISPATCH_NEXT;
         }
 
         // const-method-handle (21c format, 2 code units)
         // const-method-type (21c format, 2 code units)
+#if USE_COMPUTED_GOTO
+        op_0xFE:
+        op_0xFF: {
+#else
         case 0xFE: case 0xFF: {
+#endif
             uint8_t dst = (inst >> 8) & 0xFF;
             DX_WARN(TAG, "%s at pc=%u in %s.%s - not supported, storing null in v%u",
                      dx_opcode_name(opcode), pc,
@@ -2284,10 +3300,14 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                      method->name, dst);
             frame->registers[dst] = DX_NULL_VALUE;
             pc += 2;
-            break;
+            DISPATCH_NEXT;
         }
 
+#if USE_COMPUTED_GOTO
+        op_default: {
+#else
         default: {
+#endif
             const char *op_name = dx_opcode_name(opcode);
             const char *cls_desc = method->declaring_class ? method->declaring_class->descriptor : "?";
             const char *mth_name = method->name ? method->name : "?";
@@ -2299,12 +3319,15 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             // Skip by instruction width instead of failing
             uint32_t width = dx_opcode_width(opcode);
             pc += width;
-            break;
+            DISPATCH_NEXT;
         }
-        }
+#if !USE_COMPUTED_GOTO
+        } // end switch
+#endif
     }
 
 done:
+    #undef DISPATCH_NEXT
     #undef CODE_AT
     #undef CHECK_REG
     #undef INSN_TRACE_SIZE

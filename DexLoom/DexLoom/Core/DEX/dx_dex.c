@@ -179,6 +179,11 @@ DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
 
     // Parse string table
     dex->string_count = dex->header.string_ids_size;
+    if (dex->string_count > SIZE_MAX / sizeof(char *)) {
+        DX_ERROR(TAG, "String count %u would overflow allocation", dex->string_count);
+        dx_free(dex);
+        return DX_ERR_INVALID_FORMAT;
+    }
     dex->strings = (char **)dx_malloc(sizeof(char *) * dex->string_count);
     if (!dex->strings) goto fail;
 
@@ -186,11 +191,22 @@ DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
         uint32_t string_id_off = dex->header.string_ids_off + i * 4;
         if (string_id_off + 4 > size) break;
         uint32_t string_data_off = read_u32(data + string_id_off);
+        // Validate string data offset is within file bounds
+        if (string_data_off >= size) {
+            DX_WARN(TAG, "String %u data offset 0x%x out of bounds (file size 0x%x)",
+                    i, string_data_off, size);
+            dex->strings[i] = dx_strdup("");
+            continue;
+        }
         dex->strings[i] = decode_mutf8(data, string_data_off, size);
     }
 
     // Parse type IDs
     dex->type_count = dex->header.type_ids_size;
+    if (dex->type_count > SIZE_MAX / sizeof(DxDexTypeId)) {
+        DX_ERROR(TAG, "Type count %u would overflow allocation", dex->type_count);
+        goto fail;
+    }
     dex->type_ids = (DxDexTypeId *)dx_malloc(sizeof(DxDexTypeId) * dex->type_count);
     if (!dex->type_ids) goto fail;
     for (uint32_t i = 0; i < dex->type_count; i++) {
@@ -201,6 +217,10 @@ DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
 
     // Parse proto IDs
     dex->proto_count = dex->header.proto_ids_size;
+    if (dex->proto_count > SIZE_MAX / sizeof(DxDexProtoId)) {
+        DX_ERROR(TAG, "Proto count %u would overflow allocation", dex->proto_count);
+        goto fail;
+    }
     dex->proto_ids = (DxDexProtoId *)dx_malloc(sizeof(DxDexProtoId) * dex->proto_count);
     if (!dex->proto_ids) goto fail;
     for (uint32_t i = 0; i < dex->proto_count; i++) {
@@ -213,6 +233,10 @@ DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
 
     // Parse field IDs
     dex->field_count = dex->header.field_ids_size;
+    if (dex->field_count > SIZE_MAX / sizeof(DxDexFieldId)) {
+        DX_ERROR(TAG, "Field count %u would overflow allocation", dex->field_count);
+        goto fail;
+    }
     dex->field_ids = (DxDexFieldId *)dx_malloc(sizeof(DxDexFieldId) * dex->field_count);
     if (!dex->field_ids) goto fail;
     for (uint32_t i = 0; i < dex->field_count; i++) {
@@ -225,6 +249,10 @@ DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
 
     // Parse method IDs
     dex->method_count = dex->header.method_ids_size;
+    if (dex->method_count > SIZE_MAX / sizeof(DxDexMethodId)) {
+        DX_ERROR(TAG, "Method count %u would overflow allocation", dex->method_count);
+        goto fail;
+    }
     dex->method_ids = (DxDexMethodId *)dx_malloc(sizeof(DxDexMethodId) * dex->method_count);
     if (!dex->method_ids) goto fail;
     for (uint32_t i = 0; i < dex->method_count; i++) {
@@ -237,6 +265,10 @@ DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
 
     // Parse class definitions
     dex->class_count = dex->header.class_defs_size;
+    if (dex->class_count > SIZE_MAX / sizeof(DxDexClassDef)) {
+        DX_ERROR(TAG, "Class count %u would overflow allocation", dex->class_count);
+        goto fail;
+    }
     dex->class_defs = (DxDexClassDef *)dx_malloc(sizeof(DxDexClassDef) * dex->class_count);
     if (!dex->class_defs) goto fail;
     for (uint32_t i = 0; i < dex->class_count; i++) {
@@ -254,6 +286,15 @@ DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
 
     // Allocate class_data array (lazy parsing)
     dex->class_data = (DxDexClassData **)dx_malloc(sizeof(DxDexClassData *) * dex->class_count);
+
+    // Initialize method handle / call site tables (parsed from map list)
+    dex->method_handles = NULL;
+    dex->method_handle_count = 0;
+    dex->call_sites = NULL;
+    dex->call_site_count = 0;
+
+    // Parse method handles and call sites from the map list
+    dx_dex_parse_call_sites(dex);
 
     DX_INFO(TAG, "DEX parsed successfully");
     *out = dex;
@@ -289,6 +330,9 @@ void dx_dex_free(DxDexFile *dex) {
         }
         dx_free(dex->class_data);
     }
+
+    dx_free(dex->method_handles);
+    dx_free(dex->call_sites);
 
     dx_free(dex);
 }
@@ -334,6 +378,9 @@ DxResult dx_dex_parse_class_data(DxDexFile *dex, uint32_t class_def_idx) {
 
     // Parse static fields
     if (static_fields_count > 0) {
+        if (static_fields_count > SIZE_MAX / sizeof(DxDexEncodedField)) {
+            dx_free(cd); return DX_ERR_INVALID_FORMAT;
+        }
         cd->static_fields = (DxDexEncodedField *)dx_malloc(sizeof(DxDexEncodedField) * static_fields_count);
         if (!cd->static_fields) { dx_free(cd); return DX_ERR_OUT_OF_MEMORY; }
         uint32_t field_idx = 0;
@@ -346,6 +393,9 @@ DxResult dx_dex_parse_class_data(DxDexFile *dex, uint32_t class_def_idx) {
 
     // Parse instance fields
     if (instance_fields_count > 0) {
+        if (instance_fields_count > SIZE_MAX / sizeof(DxDexEncodedField)) {
+            dx_free(cd->static_fields); dx_free(cd); return DX_ERR_INVALID_FORMAT;
+        }
         cd->instance_fields = (DxDexEncodedField *)dx_malloc(sizeof(DxDexEncodedField) * instance_fields_count);
         if (!cd->instance_fields) { dx_free(cd->static_fields); dx_free(cd); return DX_ERR_OUT_OF_MEMORY; }
         uint32_t field_idx = 0;
@@ -358,6 +408,7 @@ DxResult dx_dex_parse_class_data(DxDexFile *dex, uint32_t class_def_idx) {
 
     // Parse direct methods
     if (direct_methods_count > 0) {
+        if (direct_methods_count > SIZE_MAX / sizeof(DxDexEncodedMethod)) goto fail_methods;
         cd->direct_methods = (DxDexEncodedMethod *)dx_malloc(sizeof(DxDexEncodedMethod) * direct_methods_count);
         if (!cd->direct_methods) goto fail_methods;
         uint32_t method_idx = 0;
@@ -371,6 +422,7 @@ DxResult dx_dex_parse_class_data(DxDexFile *dex, uint32_t class_def_idx) {
 
     // Parse virtual methods
     if (virtual_methods_count > 0) {
+        if (virtual_methods_count > SIZE_MAX / sizeof(DxDexEncodedMethod)) goto fail_methods;
         cd->virtual_methods = (DxDexEncodedMethod *)dx_malloc(sizeof(DxDexEncodedMethod) * virtual_methods_count);
         if (!cd->virtual_methods) goto fail_methods;
         uint32_t method_idx = 0;
@@ -417,6 +469,20 @@ DxResult dx_dex_parse_code_item(const DxDexFile *dex, uint32_t offset, DxDexCode
         DX_WARN(TAG, "Code item insns_size (%u) exceeds remaining file (%u bytes at offset 0x%x)",
                 out->insns_size, remaining, offset);
         return DX_ERR_INVALID_FORMAT;
+    }
+
+    // Validate tries_size is within file bounds
+    // tries array follows insns (with possible padding), each try_item is 8 bytes
+    if (out->tries_size > 0) {
+        uint32_t insns_end = offset + 16 + (uint32_t)out->insns_size * 2;
+        // Align to 4 bytes if tries_size > 0 and insns_size is odd
+        if (out->insns_size & 1) insns_end += 2;
+        uint64_t tries_end = (uint64_t)insns_end + (uint64_t)out->tries_size * 8;
+        if (tries_end > dex->raw_size) {
+            DX_WARN(TAG, "Code item tries_size (%u) exceeds file bounds at offset 0x%x",
+                    out->tries_size, offset);
+            return DX_ERR_INVALID_FORMAT;
+        }
     }
 
     // Initialize line table to empty
@@ -747,7 +813,133 @@ static void skip_encoded_value(const uint8_t **pp, const uint8_t *end) {
     }
 }
 
-// Parse an annotation_set_item at the given offset, returning type descriptors
+// Decode a single encoded_value into an DxAnnotationElement (value part only).
+// Returns true on success, false if the value type is unsupported (element left as NONE).
+static bool decode_annotation_value(const DxDexFile *dex, const uint8_t **pp, const uint8_t *end,
+                                     DxAnnotationElement *elem) {
+    if (*pp >= end) return false;
+    uint8_t type_and_arg = *(*pp)++;
+    uint8_t value_type = type_and_arg & 0x1F;
+    uint8_t value_arg = (type_and_arg >> 5) & 0x07;
+    uint32_t byte_count = value_arg + 1;
+
+    switch (value_type) {
+        case 0x00: { // VALUE_BYTE
+            if (*pp >= end) return false;
+            elem->val_type = DX_ANNO_VAL_BYTE;
+            elem->i_value = (int8_t)*(*pp)++;
+            return true;
+        }
+        case 0x02: { // VALUE_SHORT
+            if (*pp + byte_count > end) return false;
+            elem->val_type = DX_ANNO_VAL_SHORT;
+            elem->i_value = (int32_t)read_signed(*pp, byte_count);
+            *pp += byte_count;
+            return true;
+        }
+        case 0x03: { // VALUE_CHAR
+            if (*pp + byte_count > end) return false;
+            elem->val_type = DX_ANNO_VAL_CHAR;
+            elem->i_value = (int32_t)read_unsigned(*pp, byte_count);
+            *pp += byte_count;
+            return true;
+        }
+        case 0x04: { // VALUE_INT
+            if (*pp + byte_count > end) return false;
+            elem->val_type = DX_ANNO_VAL_INT;
+            elem->i_value = (int32_t)read_signed(*pp, byte_count);
+            *pp += byte_count;
+            return true;
+        }
+        case 0x06: { // VALUE_LONG
+            if (*pp + byte_count > end) return false;
+            elem->val_type = DX_ANNO_VAL_LONG;
+            elem->l_value = read_signed(*pp, byte_count);
+            *pp += byte_count;
+            return true;
+        }
+        case 0x10: { // VALUE_FLOAT
+            if (*pp + byte_count > end) return false;
+            uint32_t raw = 0;
+            for (uint32_t b = 0; b < byte_count; b++) {
+                raw |= (uint32_t)(*pp)[b] << ((4 - byte_count + b) * 8);
+            }
+            elem->val_type = DX_ANNO_VAL_FLOAT;
+            memcpy(&elem->f_value, &raw, sizeof(float));
+            *pp += byte_count;
+            return true;
+        }
+        case 0x11: { // VALUE_DOUBLE
+            if (*pp + byte_count > end) return false;
+            uint64_t raw = 0;
+            for (uint32_t b = 0; b < byte_count; b++) {
+                raw |= (uint64_t)(*pp)[b] << ((8 - byte_count + b) * 8);
+            }
+            elem->val_type = DX_ANNO_VAL_DOUBLE;
+            memcpy(&elem->d_value, &raw, sizeof(double));
+            *pp += byte_count;
+            return true;
+        }
+        case 0x17: { // VALUE_STRING
+            if (*pp + byte_count > end) return false;
+            uint32_t str_idx = (uint32_t)read_unsigned(*pp, byte_count);
+            elem->val_type = DX_ANNO_VAL_STRING;
+            elem->str_value = dx_dex_get_string(dex, str_idx);
+            *pp += byte_count;
+            return true;
+        }
+        case 0x18: { // VALUE_TYPE
+            if (*pp + byte_count > end) return false;
+            uint32_t type_idx = (uint32_t)read_unsigned(*pp, byte_count);
+            elem->val_type = DX_ANNO_VAL_TYPE;
+            elem->str_value = dx_dex_get_type(dex, type_idx);
+            *pp += byte_count;
+            return true;
+        }
+        case 0x1b: { // VALUE_ENUM (field_idx)
+            if (*pp + byte_count > end) return false;
+            uint32_t field_idx = (uint32_t)read_unsigned(*pp, byte_count);
+            elem->val_type = DX_ANNO_VAL_ENUM;
+            elem->str_value = dx_dex_get_field_name(dex, field_idx);
+            elem->extra_str = dx_dex_get_field_class(dex, field_idx);
+            *pp += byte_count;
+            return true;
+        }
+        case 0x1c: { // VALUE_ARRAY
+            uint32_t arr_size = read_uleb128(pp);
+            for (uint32_t a = 0; a < arr_size && *pp < end; a++) {
+                skip_encoded_value(pp, end);
+            }
+            elem->val_type = DX_ANNO_VAL_ARRAY;
+            elem->i_value = (int32_t)arr_size;
+            return true;
+        }
+        case 0x1d: { // VALUE_ANNOTATION (sub-annotation)
+            read_uleb128(pp); // type_idx
+            uint32_t sub_size = read_uleb128(pp);
+            for (uint32_t s = 0; s < sub_size && *pp < end; s++) {
+                read_uleb128(pp); // name_idx
+                skip_encoded_value(pp, end);
+            }
+            elem->val_type = DX_ANNO_VAL_ANNOTATION;
+            return true;
+        }
+        case 0x1e: // VALUE_NULL
+            elem->val_type = DX_ANNO_VAL_NULL;
+            return true;
+        case 0x1f: // VALUE_BOOLEAN (value is in value_arg)
+            elem->val_type = DX_ANNO_VAL_BOOLEAN;
+            elem->i_value = value_arg ? 1 : 0;
+            return true;
+        default:
+            // Unknown/unsupported — try to skip with value_arg+1 heuristic
+            if (*pp + byte_count <= end) *pp += byte_count;
+            elem->val_type = DX_ANNO_VAL_NONE;
+            return false;
+    }
+}
+
+// Parse an annotation_set_item at the given offset, returning entries with element values
 static DxResult parse_annotation_set(const DxDexFile *dex, uint32_t set_off,
                                       DxAnnotationEntry **out_entries, uint32_t *out_count) {
     *out_entries = NULL;
@@ -762,6 +954,7 @@ static DxResult parse_annotation_set(const DxDexFile *dex, uint32_t set_off,
 
     DxAnnotationEntry *entries = (DxAnnotationEntry *)dx_malloc(sizeof(DxAnnotationEntry) * size);
     if (!entries) return DX_ERR_OUT_OF_MEMORY;
+    memset(entries, 0, sizeof(DxAnnotationEntry) * size);
 
     uint32_t count = 0;
     for (uint32_t i = 0; i < size; i++) {
@@ -777,18 +970,45 @@ static DxResult parse_annotation_set(const DxDexFile *dex, uint32_t set_off,
         uint32_t type_idx = read_uleb128(&p);
         uint32_t elem_size = read_uleb128(&p);
 
-        // Skip annotation elements (name-value pairs)
-        for (uint32_t e = 0; e < elem_size && p < end; e++) {
-            read_uleb128(&p); // name_idx
-            skip_encoded_value(&p, end);
+        const char *type_desc = dx_dex_get_type(dex, type_idx);
+        if (!type_desc) {
+            // Skip elements and move on
+            for (uint32_t e = 0; e < elem_size && p < end; e++) {
+                read_uleb128(&p);
+                skip_encoded_value(&p, end);
+            }
+            continue;
         }
 
-        const char *type_desc = dx_dex_get_type(dex, type_idx);
-        if (type_desc) {
-            entries[count].type = type_desc;
-            entries[count].visibility = visibility;
-            count++;
+        entries[count].type = type_desc;
+        entries[count].visibility = visibility;
+        entries[count].elements = NULL;
+        entries[count].element_count = 0;
+
+        if (elem_size > 0) {
+            DxAnnotationElement *elems = (DxAnnotationElement *)dx_malloc(
+                sizeof(DxAnnotationElement) * elem_size);
+            if (elems) {
+                memset(elems, 0, sizeof(DxAnnotationElement) * elem_size);
+                uint32_t valid_elems = 0;
+                for (uint32_t e = 0; e < elem_size && p < end; e++) {
+                    uint32_t name_idx = read_uleb128(&p);
+                    const char *elem_name = dx_dex_get_string(dex, name_idx);
+                    elems[valid_elems].name = elem_name;
+                    decode_annotation_value(dex, &p, end, &elems[valid_elems]);
+                    valid_elems++;
+                }
+                entries[count].elements = elems;
+                entries[count].element_count = valid_elems;
+            } else {
+                // OOM — skip elements
+                for (uint32_t e = 0; e < elem_size && p < end; e++) {
+                    read_uleb128(&p);
+                    skip_encoded_value(&p, end);
+                }
+            }
         }
+        count++;
     }
 
     if (count == 0) {
@@ -871,12 +1091,29 @@ DxResult dx_dex_parse_annotations(const DxDexFile *dex, uint32_t annotations_off
     return DX_OK;
 }
 
+void dx_annotation_entry_free_elements(DxAnnotationEntry *entry) {
+    if (!entry) return;
+    dx_free(entry->elements);
+    entry->elements = NULL;
+    entry->element_count = 0;
+}
+
 void dx_dex_free_annotations(DxAnnotationsDirectory *dir) {
     if (!dir) return;
-    dx_free(dir->class_annotations);
+    if (dir->class_annotations) {
+        for (uint32_t i = 0; i < dir->class_annotation_count; i++) {
+            dx_annotation_entry_free_elements(&dir->class_annotations[i]);
+        }
+        dx_free(dir->class_annotations);
+    }
     if (dir->method_annotations) {
         for (uint32_t i = 0; i < dir->annotated_method_count; i++) {
-            dx_free(dir->method_annotations[i]);
+            if (dir->method_annotations[i]) {
+                for (uint32_t j = 0; j < dir->method_annotation_counts[i]; j++) {
+                    dx_annotation_entry_free_elements(&dir->method_annotations[i][j]);
+                }
+                dx_free(dir->method_annotations[i]);
+            }
         }
         dx_free(dir->method_annotations);
     }
@@ -1088,4 +1325,278 @@ DxResult dx_dex_parse_static_values(const DxDexFile *dex, uint32_t offset,
     }
 
     return DX_OK;
+}
+
+// ============================================================
+// Method handle and call site parsing (from DEX map list)
+// ============================================================
+
+// DEX map_list item types
+#define MAP_TYPE_METHOD_HANDLE_ITEM 0x0008
+#define MAP_TYPE_CALL_SITE_ID_ITEM  0x0007
+
+// Read an encoded_value from an encoded_array_item.
+// Returns the value and advances *pp. type_out receives the value type byte.
+static uint64_t read_encoded_value_cs(const uint8_t **pp, const uint8_t *end, uint8_t *type_out) {
+    if (*pp >= end) { *type_out = 0xFF; return 0; }
+    uint8_t header = *(*pp)++;
+    uint8_t value_type = header & 0x1F;
+    uint8_t value_arg = (header >> 5) & 0x07;
+    *type_out = value_type;
+
+    uint32_t byte_count = value_arg + 1;
+    uint64_t value = 0;
+
+    switch (value_type) {
+        case 0x00: // VALUE_BYTE
+        case 0x02: // VALUE_SHORT
+        case 0x03: // VALUE_CHAR
+        case 0x04: // VALUE_INT
+        case 0x06: // VALUE_LONG
+        case 0x10: // VALUE_FLOAT
+        case 0x11: // VALUE_DOUBLE
+        case 0x15: // VALUE_METHOD_HANDLE
+        case 0x16: // VALUE_METHOD_TYPE
+        case 0x17: // VALUE_STRING
+        case 0x18: // VALUE_TYPE
+        case 0x19: // VALUE_FIELD
+        case 0x1A: // VALUE_METHOD
+        case 0x1B: // VALUE_ENUM
+            for (uint32_t i = 0; i < byte_count && *pp < end; i++) {
+                value |= (uint64_t)(*(*pp)++) << (i * 8);
+            }
+            break;
+        case 0x1C: // VALUE_ARRAY (skip - complex, not needed for call sites)
+        case 0x1D: // VALUE_ANNOTATION (skip)
+            break;
+        case 0x1E: // VALUE_NULL
+        case 0x1F: // VALUE_BOOLEAN
+            value = value_arg; // boolean value is in value_arg
+            break;
+        default:
+            break;
+    }
+    return value;
+}
+
+DxResult dx_dex_parse_call_sites(DxDexFile *dex) {
+    if (!dex || !dex->raw_data) return DX_ERR_NULL_PTR;
+
+    const uint8_t *data = dex->raw_data;
+    uint32_t size = dex->raw_size;
+
+    // The map_list is at header.map_off
+    uint32_t map_off = dex->header.map_off;
+    if (map_off == 0 || map_off + 4 > size) return DX_OK; // no map
+
+    uint32_t map_size = read_u32(data + map_off);
+    const uint8_t *map_entries = data + map_off + 4;
+
+    uint32_t mh_offset = 0, mh_count = 0;
+    uint32_t cs_offset = 0, cs_count = 0;
+
+    // Scan map list for method_handle_item and call_site_id_item
+    for (uint32_t i = 0; i < map_size; i++) {
+        const uint8_t *entry = map_entries + i * 12;
+        if ((uintptr_t)(entry + 12) > (uintptr_t)(data + size)) break;
+        uint16_t type = read_u16(entry);
+        uint32_t count = read_u32(entry + 4);
+        uint32_t offset = read_u32(entry + 8);
+
+        if (type == MAP_TYPE_METHOD_HANDLE_ITEM) {
+            mh_offset = offset;
+            mh_count = count;
+        } else if (type == MAP_TYPE_CALL_SITE_ID_ITEM) {
+            cs_offset = offset;
+            cs_count = count;
+        }
+    }
+
+    // Parse method handles
+    if (mh_count > 0 && mh_offset > 0 && mh_offset + mh_count * 8 <= size) {
+        dex->method_handles = (DxMethodHandle *)dx_malloc(sizeof(DxMethodHandle) * mh_count);
+        if (!dex->method_handles) return DX_ERR_OUT_OF_MEMORY;
+        dex->method_handle_count = mh_count;
+
+        for (uint32_t i = 0; i < mh_count; i++) {
+            const uint8_t *p = data + mh_offset + i * 8;
+            dex->method_handles[i].method_handle_type = read_u16(p);
+            // p+2 is unused/padding
+            dex->method_handles[i].field_or_method_id = read_u16(p + 4);
+            // p+6 is unused/padding
+        }
+        DX_INFO(TAG, "Parsed %u method handles", mh_count);
+    }
+
+    // Parse call site IDs -> call site items
+    if (cs_count > 0 && cs_offset > 0 && cs_offset + cs_count * 4 <= size) {
+        dex->call_sites = (DxCallSite *)dx_malloc(sizeof(DxCallSite) * cs_count);
+        if (!dex->call_sites) return DX_ERR_OUT_OF_MEMORY;
+        memset(dex->call_sites, 0, sizeof(DxCallSite) * cs_count);
+        dex->call_site_count = cs_count;
+
+        for (uint32_t i = 0; i < cs_count; i++) {
+            // call_site_id_item is a uint32_t offset to the encoded_array_item
+            uint32_t cs_data_off = read_u32(data + cs_offset + i * 4);
+            if (cs_data_off == 0 || cs_data_off >= size) continue;
+
+            // encoded_array_item: size (uleb128), then size encoded_values
+            const uint8_t *p = data + cs_data_off;
+            const uint8_t *end = data + size;
+            uint32_t arr_size = read_uleb128(&p);
+
+            if (arr_size < 3) continue; // Need at least: MethodHandle, String, MethodType
+
+            DxCallSite *cs = &dex->call_sites[i];
+
+            // [0] VALUE_METHOD_HANDLE: bootstrap method handle index
+            uint8_t vtype;
+            uint64_t val = read_encoded_value_cs(&p, end, &vtype);
+            if (vtype != 0x15) continue; // not a method handle
+            cs->method_handle_idx = (uint32_t)val;
+
+            // [1] VALUE_STRING: method name the lambda implements
+            val = read_encoded_value_cs(&p, end, &vtype);
+            if (vtype != 0x17) continue; // not a string
+            uint32_t name_str_idx = (uint32_t)val;
+            cs->method_name = dx_dex_get_string(dex, name_str_idx);
+
+            // [2] VALUE_METHOD_TYPE: erased method type (proto index)
+            val = read_encoded_value_cs(&p, end, &vtype);
+            if (vtype != 0x16) continue; // not a method type
+            cs->proto_idx = (uint32_t)val;
+
+            // Determine what kind of bootstrap this is
+            if (cs->method_handle_idx < dex->method_handle_count) {
+                DxMethodHandle *bsm = &dex->method_handles[cs->method_handle_idx];
+                if (bsm->field_or_method_id < dex->method_count) {
+                    const char *bsm_class = dx_dex_get_method_class(dex, bsm->field_or_method_id);
+                    const char *bsm_name = dx_dex_get_method_name(dex, bsm->field_or_method_id);
+
+                    // Check for LambdaMetafactory
+                    if (bsm_class && bsm_name &&
+                        strstr(bsm_class, "LambdaMetafactory") &&
+                        strcmp(bsm_name, "metafactory") == 0) {
+                        // Additional args: [3] MethodType, [4] MethodHandle, [5] MethodType
+                        if (arr_size >= 6) {
+                            // [3] VALUE_METHOD_TYPE: target method type
+                            val = read_encoded_value_cs(&p, end, &vtype);
+                            if (vtype == 0x16) cs->target_proto_idx = (uint32_t)val;
+
+                            // [4] VALUE_METHOD_HANDLE: implementation method handle
+                            val = read_encoded_value_cs(&p, end, &vtype);
+                            if (vtype == 0x15) {
+                                uint32_t impl_mh_idx = (uint32_t)val;
+                                if (impl_mh_idx < dex->method_handle_count) {
+                                    DxMethodHandle *impl_mh = &dex->method_handles[impl_mh_idx];
+                                    cs->impl_method_idx = impl_mh->field_or_method_id;
+                                    cs->impl_kind = impl_mh->method_handle_type;
+                                }
+                            }
+
+                            // [5] VALUE_METHOD_TYPE: instantiated method type
+                            read_encoded_value_cs(&p, end, &vtype);
+                        }
+                        cs->is_string_concat = false;
+                        cs->parsed = true;
+                    }
+                    // Check for StringConcatFactory
+                    else if (bsm_class && bsm_name &&
+                             strstr(bsm_class, "StringConcatFactory") &&
+                             strcmp(bsm_name, "makeConcatWithConstants") == 0) {
+                        if (arr_size >= 4) {
+                            val = read_encoded_value_cs(&p, end, &vtype);
+                            if (vtype == 0x17) { // VALUE_STRING - recipe
+                                cs->concat_recipe = dx_dex_get_string(dex, (uint32_t)val);
+                            }
+                        }
+                        cs->is_string_concat = true;
+                        cs->parsed = true;
+                    }
+                    else {
+                        cs->parsed = true;
+                        DX_INFO(TAG, "Call site %u: unknown bootstrap %s.%s", i,
+                                bsm_class ? bsm_class : "?", bsm_name ? bsm_name : "?");
+                    }
+                }
+            }
+        }
+        DX_INFO(TAG, "Parsed %u call sites", cs_count);
+    }
+
+    return DX_OK;
+}
+
+const DxCallSite *dx_dex_get_call_site(const DxDexFile *dex, uint32_t call_site_idx) {
+    if (!dex || !dex->call_sites || call_site_idx >= dex->call_site_count) return NULL;
+    if (!dex->call_sites[call_site_idx].parsed) return NULL;
+    return &dex->call_sites[call_site_idx];
+}
+
+// ── Annotation element lookup helpers ──
+
+static const DxAnnotationElement *find_element(const DxAnnotationEntry *ann, const char *name) {
+    if (!ann || !ann->elements || !name) return NULL;
+    for (uint32_t i = 0; i < ann->element_count; i++) {
+        if (ann->elements[i].name && strcmp(ann->elements[i].name, name) == 0) {
+            return &ann->elements[i];
+        }
+    }
+    return NULL;
+}
+
+const char *dx_annotation_get_string(const DxAnnotationEntry *ann, const char *element_name) {
+    const DxAnnotationElement *e = find_element(ann, element_name);
+    if (!e || e->val_type != DX_ANNO_VAL_STRING) return NULL;
+    return e->str_value;
+}
+
+int32_t dx_annotation_get_int(const DxAnnotationEntry *ann, const char *element_name, int32_t default_val) {
+    const DxAnnotationElement *e = find_element(ann, element_name);
+    if (!e) return default_val;
+    switch (e->val_type) {
+        case DX_ANNO_VAL_BYTE:
+        case DX_ANNO_VAL_SHORT:
+        case DX_ANNO_VAL_CHAR:
+        case DX_ANNO_VAL_INT:
+        case DX_ANNO_VAL_BOOLEAN:
+            return e->i_value;
+        default:
+            return default_val;
+    }
+}
+
+int64_t dx_annotation_get_long(const DxAnnotationEntry *ann, const char *element_name, int64_t default_val) {
+    const DxAnnotationElement *e = find_element(ann, element_name);
+    if (!e) return default_val;
+    if (e->val_type == DX_ANNO_VAL_LONG) return e->l_value;
+    if (e->val_type == DX_ANNO_VAL_INT || e->val_type == DX_ANNO_VAL_SHORT
+        || e->val_type == DX_ANNO_VAL_BYTE) return (int64_t)e->i_value;
+    return default_val;
+}
+
+float dx_annotation_get_float(const DxAnnotationEntry *ann, const char *element_name, float default_val) {
+    const DxAnnotationElement *e = find_element(ann, element_name);
+    if (!e || e->val_type != DX_ANNO_VAL_FLOAT) return default_val;
+    return e->f_value;
+}
+
+double dx_annotation_get_double(const DxAnnotationEntry *ann, const char *element_name, double default_val) {
+    const DxAnnotationElement *e = find_element(ann, element_name);
+    if (!e) return default_val;
+    if (e->val_type == DX_ANNO_VAL_DOUBLE) return e->d_value;
+    if (e->val_type == DX_ANNO_VAL_FLOAT) return (double)e->f_value;
+    return default_val;
+}
+
+bool dx_annotation_get_bool(const DxAnnotationEntry *ann, const char *element_name, bool default_val) {
+    const DxAnnotationElement *e = find_element(ann, element_name);
+    if (!e || e->val_type != DX_ANNO_VAL_BOOLEAN) return default_val;
+    return e->i_value != 0;
+}
+
+const char *dx_annotation_get_type(const DxAnnotationEntry *ann, const char *element_name) {
+    const DxAnnotationElement *e = find_element(ann, element_name);
+    if (!e || e->val_type != DX_ANNO_VAL_TYPE) return NULL;
+    return e->str_value;
 }

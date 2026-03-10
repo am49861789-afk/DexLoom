@@ -27,6 +27,8 @@ static void append_string(char ***array, uint32_t *count, const char *str) {
 #define AXML_CHUNK_END_TAG     0x0103
 #define AXML_CHUNK_TEXT        0x0104
 #define AXML_FILE_MAGIC        0x00080003
+#define AXML_MAX_DEPTH         100    // Maximum XML nesting depth
+#define AXML_MAX_STRING_POOL   1000000 // Maximum string pool entries (1M)
 
 // Well-known Android resource IDs
 #define ATTR_NAME       0x01010003
@@ -128,6 +130,19 @@ DxResult dx_axml_parse(const uint8_t *data, uint32_t size, DxAxmlParser **out) {
     uint32_t flags = read_u32(data + pos + 16);
     uint32_t strings_start = read_u32(data + pos + 20);
     bool is_utf8 = (flags & (1 << 8)) != 0;
+
+    // Limit string pool size to prevent excessive allocations
+    if (string_count > AXML_MAX_STRING_POOL) {
+        DX_ERROR(TAG, "AXML string pool too large: %u entries (max %u)",
+                 string_count, AXML_MAX_STRING_POOL);
+        goto fail;
+    }
+
+    // Integer overflow protection on string pool allocation
+    if (string_count > SIZE_MAX / sizeof(char *)) {
+        DX_ERROR(TAG, "AXML string pool count %u would overflow allocation", string_count);
+        goto fail;
+    }
 
     parser->string_count = string_count;
     parser->strings = (char **)dx_malloc(sizeof(char *) * string_count);
@@ -314,6 +329,7 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
     char *current_activity_name = NULL;
 
     bool in_application = false;
+    uint32_t xml_depth = 0;  // Track XML nesting depth
 
     while (pos + 8 <= size) {
         uint16_t chunk_type = read_u16(data + pos);
@@ -322,6 +338,14 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
         if (chunk_size < 8 || pos + chunk_size > size) break;
 
         if (chunk_type == AXML_CHUNK_START_TAG) {
+            xml_depth++;
+            if (xml_depth > AXML_MAX_DEPTH) {
+                DX_ERROR(TAG, "AXML nesting depth exceeds limit (%u)", AXML_MAX_DEPTH);
+                dx_free(current_activity_name);
+                dx_axml_free(axml);
+                dx_manifest_free(manifest);
+                return DX_ERR_AXML_INVALID;
+            }
             if (pos + 28 > size) break;
 
             uint32_t name_idx = read_u32(data + pos + 20);
@@ -741,6 +765,7 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                 dx_free(md_value);
             }
         } else if (chunk_type == AXML_CHUNK_END_TAG) {
+            if (xml_depth > 0) xml_depth--;
             uint32_t name_idx = read_u32(data + pos + 20);
             const char *tag_name = (name_idx < axml->string_count) ?
                                     axml->strings[name_idx] : "";

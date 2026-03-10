@@ -4,6 +4,13 @@
 #include "dx_types.h"
 #include "dx_dex.h"
 
+// Release vs Debug build configuration
+#ifdef NDEBUG
+#define DX_RELEASE 1
+#else
+#define DX_RELEASE 0
+#endif
+
 // Class status
 typedef enum {
     DX_CLASS_NOT_LOADED = 0,
@@ -45,11 +52,8 @@ struct DxClass {
     DxMethod       **vtable;
     uint32_t         vtable_size;
 
-    // Annotations
-    struct {
-        const char *type;     // annotation type descriptor e.g. "Lretrofit2/http/GET;"
-        uint8_t visibility;   // 0=BUILD, 1=RUNTIME, 2=SYSTEM
-    } *annotations;
+    // Annotations (with element values)
+    DxAnnotationEntry *annotations;
     uint32_t annotation_count;
 
     // DEX origin
@@ -77,14 +81,14 @@ struct DxMethod {
     DxNativeMethodFn   native_fn;
     bool               is_native;
 
+    // Verification flag (set after bytecode passes structural verification)
+    bool               verified;
+
     // VTable index (-1 if not virtual)
     int32_t            vtable_idx;
 
-    // Annotations
-    struct {
-        const char *type;     // annotation type descriptor
-        uint8_t visibility;   // 0=BUILD, 1=RUNTIME, 2=SYSTEM
-    } *annotations;
+    // Annotations (with element values)
+    DxAnnotationEntry *annotations;
     uint32_t           annotation_count;
 };
 
@@ -118,6 +122,13 @@ struct DxFrame {
 
 // VM state
 #define DX_MAX_DEX_FILES 8
+
+// Forward declaration for missing feature tracker (full definition below)
+#define DX_MAX_MISSING_FEATURES 32
+typedef struct {
+    char features[DX_MAX_MISSING_FEATURES][128];
+    uint32_t count;
+} DxMissingFeatures;
 
 struct DxVM {
     DxContext  *ctx;
@@ -206,6 +217,14 @@ struct DxVM {
     // Pending exception for cross-method unwinding
     DxObject  *pending_exception;
 
+    // Watchdog: detect stuck interpreter (wall-clock timeout)
+    uint64_t watchdog_start_time;   // mach_absolute_time() when top-level execute began
+    uint32_t watchdog_timeout_ms;   // 0 = disabled, default 10000 (10 s)
+    bool     watchdog_triggered;
+
+    // Missing feature tracker
+    DxMissingFeatures missing_features;
+
     // Diagnostic info captured on error
     struct {
         bool     has_error;
@@ -265,13 +284,31 @@ DxMethod *dx_vm_find_interface_method(DxVM *vm, DxClass *cls, const char *name, 
 DxFrame *dx_vm_alloc_frame(DxVM *vm);
 void     dx_vm_free_frame(DxVM *vm, DxFrame *frame);
 
+// Bytecode verification (called automatically before first execution)
+DxResult dx_verify_method(DxDexFile *dex, DxMethod *method);
+
 // Execution
 DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args, uint32_t arg_count, DxValue *result);
 DxResult dx_vm_run_main_activity(DxVM *vm, const char *activity_class);
 
+// invoke-custom (lambda / string concat)
+DxResult dx_vm_invoke_custom(DxVM *vm, DxFrame *frame, uint32_t call_site_idx,
+                              DxValue *args, uint32_t arg_count);
+
+// Annotation lookup on class/method
+const DxAnnotationEntry *dx_class_get_annotation(DxClass *cls, const char *type_desc);
+const DxAnnotationEntry *dx_method_get_annotation(DxMethod *method, const char *type_desc);
+
+// Garbage collection — force a full mark-sweep cycle (e.g. on memory pressure)
+void dx_vm_gc_collect(DxVM *vm);
+
 // Diagnostics
 char *dx_vm_heap_stats(DxVM *vm);
 char *dx_vm_get_last_error_detail(DxVM *vm);
+
+// Missing feature tracking
+void        dx_vm_report_missing_feature(DxVM *vm, const char *feature);
+const char *dx_vm_get_missing_features(DxVM *vm);
 
 // Crash isolation (signal-based recovery)
 #include <setjmp.h>

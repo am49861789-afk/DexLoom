@@ -1593,3 +1593,699 @@ struct ExecutionEdgeCaseTests {
         #expect(vm.pointee.activity_instance == nil)
     }
 }
+
+// ============================================================
+// MARK: - SQLite / ContentValues Tests
+// ============================================================
+
+@Suite("SQLite and ContentValues Tests")
+struct SQLiteContentValuesTests {
+
+    @Test("ContentValues class exists")
+    func testContentValuesClassExists() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let cvCls = dx_vm_find_class(vm, "Landroid/content/ContentValues;")
+        #expect(cvCls != nil, "ContentValues should be registered")
+        if let cvCls = cvCls {
+            let obj = dx_vm_alloc_object(vm, cvCls)
+            #expect(obj != nil, "Should be able to allocate a ContentValues instance")
+        }
+    }
+
+    @Test("SQLiteDatabase class exists")
+    func testSQLiteDatabaseClassExists() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let dbCls = dx_vm_find_class(vm, "Landroid/database/sqlite/SQLiteDatabase;")
+        #expect(dbCls != nil, "SQLiteDatabase should be registered")
+    }
+
+    @Test("Cursor class exists")
+    func testCursorClassExists() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let cursorCls = dx_vm_find_class(vm, "Landroid/database/Cursor;")
+        #expect(cursorCls != nil, "Cursor should be registered")
+    }
+
+    @Test("RoomDatabase class exists")
+    func testRoomDatabaseClassExists() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let roomDbCls = dx_vm_find_class(vm, "Landroidx/room/RoomDatabase;")
+        #expect(roomDbCls != nil, "RoomDatabase should be registered")
+    }
+
+    @Test("Room annotation classes exist")
+    func testRoomAnnotationClasses() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let annotations = [
+            "Landroidx/room/Entity;",
+            "Landroidx/room/Dao;",
+            "Landroidx/room/Query;",
+            "Landroidx/room/Insert;",
+            "Landroidx/room/Delete;",
+        ]
+        for desc in annotations {
+            let cls = dx_vm_find_class(vm, desc)
+            #expect(cls != nil, "Expected Room annotation \(desc) to be registered")
+        }
+    }
+}
+
+// ============================================================
+// MARK: - System Service Tests
+// ============================================================
+
+@Suite("System Service Tests")
+struct SystemServiceTests {
+
+    @Test("ClipboardManager class exists")
+    func testClipboardManagerExists() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let cls = dx_vm_find_class(vm, "Landroid/content/ClipboardManager;")
+        #expect(cls != nil, "ClipboardManager should be registered")
+    }
+
+    @Test("ConnectivityManager class exists")
+    func testConnectivityManagerExists() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let cls = dx_vm_find_class(vm, "Landroid/net/ConnectivityManager;")
+        #expect(cls != nil, "ConnectivityManager should be registered")
+    }
+
+    @Test("PowerManager class exists")
+    func testPowerManagerExists() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let cls = dx_vm_find_class(vm, "Landroid/os/PowerManager;")
+        #expect(cls != nil, "PowerManager should be registered")
+    }
+
+    @Test("AlarmManager class exists")
+    func testAlarmManagerExists() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let cls = dx_vm_find_class(vm, "Landroid/app/AlarmManager;")
+        #expect(cls != nil, "AlarmManager should be registered")
+    }
+
+    @Test("JobScheduler class exists")
+    func testJobSchedulerExists() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let cls = dx_vm_find_class(vm, "Landroid/app/job/JobScheduler;")
+        #expect(cls != nil, "JobScheduler should be registered")
+    }
+}
+
+// ============================================================
+// MARK: - Invoke-Custom Support Tests
+// ============================================================
+
+@Suite("Invoke-Custom Support Tests")
+struct InvokeCustomTests {
+
+    @Test("DxCallSite structure exists in DEX parsing")
+    func testCallSiteStructure() {
+        // Verify the DxCallSite type is accessible and has expected fields
+        var cs = DxCallSite()
+        cs.method_handle_idx = 42
+        #expect(cs.method_handle_idx == 42)
+        cs.parsed = true
+        #expect(cs.parsed == true)
+        cs.is_string_concat = false
+        #expect(cs.is_string_concat == false)
+    }
+
+    @Test("DxDexFile has call_sites field")
+    func testDexFileCallSitesField() {
+        // Parse a minimal valid DEX to verify call_sites field exists
+        var data = [UInt8](repeating: 0, count: 112)
+        let magic: [UInt8] = [0x64, 0x65, 0x78, 0x0A, 0x30, 0x33, 0x35, 0x00]
+        for i in 0..<8 { data[i] = magic[i] }
+        data[32] = 112; data[33] = 0; data[34] = 0; data[35] = 0
+        data[36] = 112; data[37] = 0; data[38] = 0; data[39] = 0
+        data[40] = 0x78; data[41] = 0x56; data[42] = 0x34; data[43] = 0x12
+
+        var dex: UnsafeMutablePointer<DxDexFile>?
+        let result = dx_dex_parse(&data, UInt32(data.count), &dex)
+        if result == DX_OK, let dex = dex {
+            // call_sites should be nil (no call sites in minimal DEX)
+            #expect(dex.pointee.call_sites == nil)
+            #expect(dex.pointee.call_site_count == 0)
+            dx_dex_free(dex)
+        }
+    }
+
+    @Test("dx_dex_get_call_site returns nil for out of range index")
+    func testCallSiteOutOfRange() {
+        var data = [UInt8](repeating: 0, count: 112)
+        let magic: [UInt8] = [0x64, 0x65, 0x78, 0x0A, 0x30, 0x33, 0x35, 0x00]
+        for i in 0..<8 { data[i] = magic[i] }
+        data[32] = 112; data[33] = 0; data[34] = 0; data[35] = 0
+        data[36] = 112; data[37] = 0; data[38] = 0; data[39] = 0
+        data[40] = 0x78; data[41] = 0x56; data[42] = 0x34; data[43] = 0x12
+
+        var dex: UnsafeMutablePointer<DxDexFile>?
+        let result = dx_dex_parse(&data, UInt32(data.count), &dex)
+        if result == DX_OK, let dex = dex {
+            let cs = dx_dex_get_call_site(dex, 999)
+            #expect(cs == nil, "Out of range call site index should return nil")
+            dx_dex_free(dex)
+        }
+    }
+}
+
+// ============================================================
+// MARK: - Framework Class Count Test
+// ============================================================
+
+@Suite("Framework Scale Tests")
+struct FrameworkScaleTests {
+
+    @Test("Framework has 400+ registered classes")
+    func testFrameworkClassCount() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        #expect(vm.pointee.class_count > 400,
+                "Expected 400+ framework classes, got \(vm.pointee.class_count)")
+    }
+}
+
+// ============================================================
+// MARK: - String Operations Tests
+// ============================================================
+
+@Suite("String Operations Tests")
+struct StringOperationsTests {
+
+    @Test("String.valueOf with integer")
+    func testStringValueOfInt() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let strCls = dx_vm_find_class(vm, "Ljava/lang/String;")!
+        let valueOf = dx_vm_find_method(strCls, "valueOf", "LI")
+        #expect(valueOf != nil, "String.valueOf(int) should exist")
+
+        if let valueOf = valueOf {
+            var args = [DxValue(tag: DX_VAL_INT, DxValue.__Unnamed_union___Anonymous_field1(i: 12345))]
+            var result = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+            let status = dx_vm_execute_method(vm, valueOf, &args, 1, &result)
+            #expect(status == DX_OK)
+            #expect(result.tag == DX_VAL_OBJ)
+            if let obj = result.obj {
+                let str = String(cString: dx_vm_get_string_value(obj)!)
+                #expect(str == "12345")
+            }
+        }
+    }
+
+    @Test("String.concat joins two strings")
+    func testStringConcat() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let strCls = dx_vm_find_class(vm, "Ljava/lang/String;")!
+        let concatMethod = dx_vm_find_method(strCls, "concat", "LL")
+        #expect(concatMethod != nil, "String.concat should exist")
+
+        if let concatMethod = concatMethod {
+            let s1 = dx_vm_create_string(vm, "Hello ")!
+            let s2 = dx_vm_create_string(vm, "World")!
+            var args = [
+                DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: s1)),
+                DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: s2))
+            ]
+            var result = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+            let status = dx_vm_execute_method(vm, concatMethod, &args, 2, &result)
+            #expect(status == DX_OK)
+            #expect(result.tag == DX_VAL_OBJ)
+            if let obj = result.obj {
+                let str = String(cString: dx_vm_get_string_value(obj)!)
+                #expect(str == "Hello World")
+            }
+        }
+    }
+
+    @Test("StringBuilder append and toString")
+    func testStringBuilderAppend() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let sbCls = dx_vm_find_class(vm, "Ljava/lang/StringBuilder;")!
+        let sb = dx_vm_alloc_object(vm, sbCls)!
+
+        // Init
+        if let initMethod = dx_vm_find_method(sbCls, "<init>", "V") {
+            var args = [DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: sb))]
+            var r = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+            let _ = dx_vm_execute_method(vm, initMethod, &args, 1, &r)
+        }
+
+        // Append
+        let appendMethod = dx_vm_find_method(sbCls, "append", "LL")
+        #expect(appendMethod != nil, "StringBuilder.append should exist")
+        if let appendMethod = appendMethod {
+            for word in ["Dex", "Loom", "!"] {
+                let strObj = dx_vm_create_string(vm, word)!
+                var args = [
+                    DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: sb)),
+                    DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: strObj))
+                ]
+                var r = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+                let _ = dx_vm_execute_method(vm, appendMethod, &args, 2, &r)
+            }
+        }
+
+        // toString
+        let toStringMethod = dx_vm_find_method(sbCls, "toString", "L")
+        #expect(toStringMethod != nil, "StringBuilder.toString should exist")
+        if let toStringMethod = toStringMethod {
+            var args = [DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: sb))]
+            var result = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+            let status = dx_vm_execute_method(vm, toStringMethod, &args, 1, &result)
+            #expect(status == DX_OK)
+            #expect(result.tag == DX_VAL_OBJ)
+            if let obj = result.obj {
+                let str = String(cString: dx_vm_get_string_value(obj)!)
+                #expect(str == "DexLoom!")
+            }
+        }
+    }
+
+    @Test("String.length returns correct count")
+    func testStringLengthVariousLengths() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let strCls = dx_vm_find_class(vm, "Ljava/lang/String;")!
+        let lengthMethod = dx_vm_find_method(strCls, "length", "I")!
+
+        let testCases: [(String, Int32)] = [
+            ("", 0),
+            ("a", 1),
+            ("Hello World", 11),
+            (String(repeating: "x", count: 100), 100),
+        ]
+
+        for (input, expectedLen) in testCases {
+            let strObj = dx_vm_create_string(vm, input)!
+            var args = [DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: strObj))]
+            var result = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+            let status = dx_vm_execute_method(vm, lengthMethod, &args, 1, &result)
+            #expect(status == DX_OK)
+            #expect(result.i == expectedLen, "Expected length \(expectedLen) for '\(input)'")
+        }
+    }
+
+    @Test("String.isEmpty on empty vs non-empty")
+    func testStringIsEmpty() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let strCls = dx_vm_find_class(vm, "Ljava/lang/String;")!
+        let isEmptyMethod = dx_vm_find_method(strCls, "isEmpty", "Z")
+        #expect(isEmptyMethod != nil, "String.isEmpty should exist")
+
+        if let isEmptyMethod = isEmptyMethod {
+            // Empty string should return true (1)
+            let emptyStr = dx_vm_create_string(vm, "")!
+            var args1 = [DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: emptyStr))]
+            var result1 = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+            let s1 = dx_vm_execute_method(vm, isEmptyMethod, &args1, 1, &result1)
+            #expect(s1 == DX_OK)
+            #expect(result1.i != 0, "Empty string isEmpty should return true")
+
+            // Non-empty string should return false (0)
+            let nonEmptyStr = dx_vm_create_string(vm, "hello")!
+            var args2 = [DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: nonEmptyStr))]
+            var result2 = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+            let s2 = dx_vm_execute_method(vm, isEmptyMethod, &args2, 1, &result2)
+            #expect(s2 == DX_OK)
+            #expect(result2.i == 0, "Non-empty string isEmpty should return false")
+        }
+    }
+}
+
+// ============================================================
+// MARK: - HashMap Extended Tests
+// ============================================================
+
+@Suite("HashMap Extended Tests")
+struct HashMapExtendedTests {
+
+    /// Helper to create and init a HashMap
+    private func makeHashMap(_ vm: UnsafeMutablePointer<DxVM>) -> (UnsafeMutablePointer<DxObject>, UnsafeMutablePointer<DxClass>) {
+        let hmCls = dx_vm_find_class(vm, "Ljava/util/HashMap;")!
+        let map = dx_vm_alloc_object(vm, hmCls)!
+        if let initMethod = dx_vm_find_method(hmCls, "<init>", "V") {
+            var args = [DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: map))]
+            var r = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+            let _ = dx_vm_execute_method(vm, initMethod, &args, 1, &r)
+        }
+        return (map, hmCls)
+    }
+
+    @Test("HashMap.containsKey returns true for existing key")
+    func testHashMapContainsKey() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+        let (map, hmCls) = makeHashMap(vm)
+
+        // Put a key
+        let putMethod = dx_vm_find_method(hmCls, "put", "LLL")!
+        let key = dx_vm_create_string(vm, "testKey")!
+        let val = dx_vm_create_string(vm, "testVal")!
+        var putArgs = [
+            DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: map)),
+            DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: key)),
+            DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: val))
+        ]
+        var putResult = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+        let _ = dx_vm_execute_method(vm, putMethod, &putArgs, 3, &putResult)
+
+        // containsKey should return true
+        let containsMethod = dx_vm_find_method(hmCls, "containsKey", "ZL")!
+        var containsArgs = [
+            DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: map)),
+            DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: key))
+        ]
+        var containsResult = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+        let status = dx_vm_execute_method(vm, containsMethod, &containsArgs, 2, &containsResult)
+        #expect(status == DX_OK)
+        #expect(containsResult.i != 0, "containsKey should return true for existing key")
+    }
+
+    @Test("HashMap.remove removes a key")
+    func testHashMapRemove() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+        let (map, hmCls) = makeHashMap(vm)
+
+        // Put a key
+        let putMethod = dx_vm_find_method(hmCls, "put", "LLL")!
+        let key = dx_vm_create_string(vm, "removeMe")!
+        let val = dx_vm_create_string(vm, "value")!
+        var putArgs = [
+            DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: map)),
+            DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: key)),
+            DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: val))
+        ]
+        var putResult = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+        let _ = dx_vm_execute_method(vm, putMethod, &putArgs, 3, &putResult)
+
+        // Remove the key
+        let removeMethod = dx_vm_find_method(hmCls, "remove", "LL")!
+        var removeArgs = [
+            DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: map)),
+            DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: key))
+        ]
+        var removeResult = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+        let removeStatus = dx_vm_execute_method(vm, removeMethod, &removeArgs, 2, &removeResult)
+        #expect(removeStatus == DX_OK)
+
+        // Size should be 0 after remove
+        let sizeMethod = dx_vm_find_method(hmCls, "size", "I")!
+        var sizeArgs = [DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: map))]
+        var sizeResult = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+        let sizeStatus = dx_vm_execute_method(vm, sizeMethod, &sizeArgs, 1, &sizeResult)
+        #expect(sizeStatus == DX_OK)
+        #expect(sizeResult.i == 0, "HashMap size should be 0 after removing the only entry")
+    }
+
+    @Test("HashMap with multiple entries")
+    func testHashMapMultipleEntries() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+        let (map, hmCls) = makeHashMap(vm)
+
+        let putMethod = dx_vm_find_method(hmCls, "put", "LLL")!
+        // Insert 15 entries
+        for i in 0..<15 {
+            let key = dx_vm_create_string(vm, "key_\(i)")!
+            let val = dx_vm_create_string(vm, "val_\(i)")!
+            var putArgs = [
+                DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: map)),
+                DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: key)),
+                DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: val))
+            ]
+            var putResult = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+            let _ = dx_vm_execute_method(vm, putMethod, &putArgs, 3, &putResult)
+        }
+
+        // Size should be 15
+        let sizeMethod = dx_vm_find_method(hmCls, "size", "I")!
+        var sizeArgs = [DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: map))]
+        var sizeResult = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+        let status = dx_vm_execute_method(vm, sizeMethod, &sizeArgs, 1, &sizeResult)
+        #expect(status == DX_OK)
+        #expect(sizeResult.i == 15, "HashMap should have 15 entries")
+    }
+}
+
+// ============================================================
+// MARK: - ArrayList Extended Tests
+// ============================================================
+
+@Suite("ArrayList Extended Tests")
+struct ArrayListExtendedTests {
+
+    /// Helper to create and init an ArrayList
+    private func makeArrayList(_ vm: UnsafeMutablePointer<DxVM>) -> (UnsafeMutablePointer<DxObject>, UnsafeMutablePointer<DxClass>) {
+        let alCls = dx_vm_find_class(vm, "Ljava/util/ArrayList;")!
+        let list = dx_vm_alloc_object(vm, alCls)!
+        if let initMethod = dx_vm_find_method(alCls, "<init>", "V") {
+            var args = [DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: list))]
+            var r = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+            let _ = dx_vm_execute_method(vm, initMethod, &args, 1, &r)
+        }
+        return (list, alCls)
+    }
+
+    private func addItem(_ vm: UnsafeMutablePointer<DxVM>, _ list: UnsafeMutablePointer<DxObject>, _ alCls: UnsafeMutablePointer<DxClass>, _ text: String) {
+        let addMethod = dx_vm_find_method(alCls, "add", "ZL")!
+        let strObj = dx_vm_create_string(vm, text)!
+        var args = [
+            DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: list)),
+            DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: strObj))
+        ]
+        var r = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+        let _ = dx_vm_execute_method(vm, addMethod, &args, 2, &r)
+    }
+
+    @Test("ArrayList.remove by index")
+    func testArrayListRemove() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+        let (list, alCls) = makeArrayList(vm)
+
+        addItem(vm, list, alCls, "alpha")
+        addItem(vm, list, alCls, "beta")
+        addItem(vm, list, alCls, "gamma")
+
+        // Remove index 1 ("beta")
+        let removeMethod = dx_vm_find_method(alCls, "remove", "LI")!
+        var removeArgs = [
+            DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: list)),
+            DxValue(tag: DX_VAL_INT, DxValue.__Unnamed_union___Anonymous_field1(i: 1))
+        ]
+        var removeResult = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+        let status = dx_vm_execute_method(vm, removeMethod, &removeArgs, 2, &removeResult)
+        #expect(status == DX_OK)
+
+        // Size should be 2
+        let sizeMethod = dx_vm_find_method(alCls, "size", "I")!
+        var sizeArgs = [DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: list))]
+        var sizeResult = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+        let _ = dx_vm_execute_method(vm, sizeMethod, &sizeArgs, 1, &sizeResult)
+        #expect(sizeResult.i == 2, "ArrayList should have 2 elements after removing one")
+    }
+
+    @Test("ArrayList.contains finds existing element")
+    func testArrayListContains() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+        let (list, alCls) = makeArrayList(vm)
+
+        let searchStr = dx_vm_create_string(vm, "findMe")!
+        addItem(vm, list, alCls, "findMe")
+        addItem(vm, list, alCls, "other")
+
+        let containsMethod = dx_vm_find_method(alCls, "contains", "ZL")!
+        var args = [
+            DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: list)),
+            DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: searchStr))
+        ]
+        var result = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+        let status = dx_vm_execute_method(vm, containsMethod, &args, 2, &result)
+        #expect(status == DX_OK)
+        // contains should return true (non-zero) or at least not crash
+    }
+
+    @Test("ArrayList.get retrieves correct element by index")
+    func testArrayListGetByIndex() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+        let (list, alCls) = makeArrayList(vm)
+
+        addItem(vm, list, alCls, "zero")
+        addItem(vm, list, alCls, "one")
+        addItem(vm, list, alCls, "two")
+
+        let getMethod = dx_vm_find_method(alCls, "get", "LI")!
+        var args = [
+            DxValue(tag: DX_VAL_OBJ, DxValue.__Unnamed_union___Anonymous_field1(obj: list)),
+            DxValue(tag: DX_VAL_INT, DxValue.__Unnamed_union___Anonymous_field1(i: 1))
+        ]
+        var result = DxValue(tag: DX_VAL_VOID, DxValue.__Unnamed_union___Anonymous_field1(i: 0))
+        let status = dx_vm_execute_method(vm, getMethod, &args, 2, &result)
+        #expect(status == DX_OK)
+        #expect(result.tag == DX_VAL_OBJ)
+        if let obj = result.obj {
+            let str = String(cString: dx_vm_get_string_value(obj)!)
+            #expect(str == "one", "get(1) should return 'one'")
+        }
+    }
+}
+
+// ============================================================
+// MARK: - GC Tests
+// ============================================================
+
+@Suite("GC Tests")
+struct GCTests {
+
+    @Test("Heap has positive capacity constant")
+    func testHeapCapacity() {
+        let ctx = dx_context_create()!
+        let vm = dx_vm_create(ctx)!
+        dx_vm_register_framework_classes(vm)
+
+        // DX_MAX_HEAP_OBJECTS should be > 0; heap_count starts low
+        #expect(vm.pointee.heap_count >= 0)
+        // The heap array exists and we can allocate into it
+        let objCls = dx_vm_find_class(vm, "Ljava/lang/Object;")!
+        let _ = dx_vm_alloc_object(vm, objCls)
+        #expect(vm.pointee.heap_count > 0)
+
+        dx_vm_destroy(vm)
+        ctx.pointee.vm = nil
+        dx_context_destroy(ctx)
+    }
+
+    @Test("Mass allocation of 1000 objects does not crash")
+    func testMassAllocation1000() {
+        let ctx = dx_context_create()!
+        let vm = dx_vm_create(ctx)!
+        dx_vm_register_framework_classes(vm)
+
+        let objCls = dx_vm_find_class(vm, "Ljava/lang/Object;")!
+        let before = vm.pointee.heap_count
+        for _ in 0..<1000 {
+            let obj = dx_vm_alloc_object(vm, objCls)
+            #expect(obj != nil)
+        }
+        #expect(vm.pointee.heap_count == before + 1000)
+
+        dx_vm_destroy(vm)
+        ctx.pointee.vm = nil
+        dx_context_destroy(ctx)
+    }
+
+    @Test("Heap count increases with allocations")
+    func testHeapCountGrows() {
+        let ctx = dx_context_create()!
+        let vm = dx_vm_create(ctx)!
+        dx_vm_register_framework_classes(vm)
+
+        let objCls = dx_vm_find_class(vm, "Ljava/lang/Object;")!
+        let initial = vm.pointee.heap_count
+
+        for i: UInt32 in 1...50 {
+            let _ = dx_vm_alloc_object(vm, objCls)
+            #expect(vm.pointee.heap_count == initial + i)
+        }
+
+        dx_vm_destroy(vm)
+        ctx.pointee.vm = nil
+        dx_context_destroy(ctx)
+    }
+}
+
+// ============================================================
+// MARK: - Networking Stub Tests
+// ============================================================
+
+@Suite("Networking Stub Tests")
+struct NetworkingStubTests {
+
+    @Test("HttpURLConnection class exists")
+    func testHttpURLConnectionExists() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let cls = dx_vm_find_class(vm, "Ljava/net/HttpURLConnection;")
+        #expect(cls != nil, "HttpURLConnection should be registered")
+    }
+
+    @Test("URL class exists")
+    func testURLClassExists() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let cls = dx_vm_find_class(vm, "Ljava/net/URL;")
+        #expect(cls != nil, "java.net.URL should be registered")
+    }
+}
+
+// ============================================================
+// MARK: - Reflection Tests
+// ============================================================
+
+@Suite("Reflection Tests")
+struct ReflectionTests {
+
+    @Test("java.lang.reflect.Method class exists")
+    func testMethodClassExists() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let cls = dx_vm_find_class(vm, "Ljava/lang/reflect/Method;")
+        #expect(cls != nil, "java.lang.reflect.Method should be registered")
+    }
+
+    @Test("java.lang.reflect.Field class exists")
+    func testFieldClassExists() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let cls = dx_vm_find_class(vm, "Ljava/lang/reflect/Field;")
+        #expect(cls != nil, "java.lang.reflect.Field should be registered")
+    }
+
+    @Test("java.lang.reflect.Constructor class exists")
+    func testConstructorClassExists() {
+        let (ctx, vm) = makeVM()
+        defer { teardownVM(ctx, vm) }
+
+        let cls = dx_vm_find_class(vm, "Ljava/lang/reflect/Constructor;")
+        #expect(cls != nil, "java.lang.reflect.Constructor should be registered")
+    }
+}

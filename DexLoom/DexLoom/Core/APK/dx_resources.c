@@ -32,7 +32,17 @@
 
 #define INITIAL_ENTRY_CAPACITY 256
 #define INITIAL_STYLE_CAPACITY 64
+#define INITIAL_ARRAY_CAPACITY 32
+#define INITIAL_PLURAL_CAPACITY 16
 #define MAX_STYLE_PARENT_DEPTH 20
+
+// Plural bag key constants (from Android's ResourceTypes.h)
+#define PLURAL_KEY_ZERO   0x01000004
+#define PLURAL_KEY_ONE    0x01000005
+#define PLURAL_KEY_TWO    0x01000006
+#define PLURAL_KEY_FEW    0x01000007
+#define PLURAL_KEY_MANY   0x01000008
+#define PLURAL_KEY_OTHER  0x01000009
 
 // ResTable_config field offsets within the config blob (relative to config start)
 // See Android's ResourceTypes.h ResTable_config struct layout:
@@ -96,6 +106,24 @@ static DxResConfig parse_res_config(const uint8_t *cfg_data, uint32_t cfg_size) 
         c.screen_width = read_u16(cfg_data + 20);
         c.screen_height = read_u16(cfg_data + 22);
     }
+    // screenLayout (offset 32): bits 0-3 = screen size
+    if (cfg_size >= 33) {
+        uint8_t screen_layout = cfg_data[32];
+        c.screen_layout = screen_layout;
+        uint8_t sz = screen_layout & 0x0F;
+        if (sz >= 1 && sz <= 4) {
+            c.screen_size = sz;
+        }
+    }
+    // uiMode (offset 33): bits 4-5 = night mode (mask 0x30, shift 4)
+    if (cfg_size >= 34) {
+        uint8_t ui_mode = cfg_data[33];
+        c.ui_mode = ui_mode;
+        uint8_t night = (ui_mode >> 4) & 0x03;
+        if (night == 1 || night == 2) {
+            c.night_mode = night;
+        }
+    }
     // smallestScreenWidthDp (offset 36)
     if (cfg_size >= 38) {
         c.smallest_screen_width_dp = read_u16(cfg_data + 36);
@@ -114,6 +142,8 @@ void dx_device_config_init(DxDeviceConfig *cfg) {
     cfg->screen_width = 393;  // iPhone 15 Pro logical width
     cfg->screen_height = 852; // iPhone 15 Pro logical height
     cfg->orientation = 1;     // portrait
+    cfg->night_mode = DX_NIGHT_MODE_NOTNIGHT;  // default: not night
+    cfg->screen_size = DX_SCREEN_SIZE_NORMAL;  // default: normal (iPhone)
 }
 
 // Check if a resource config is "default" (all qualifiers zero/empty)
@@ -121,7 +151,8 @@ static bool is_default_config(const DxResConfig *c) {
     return c->language[0] == 0 && c->country[0] == 0 &&
            c->density == 0 && c->sdk_version == 0 &&
            c->orientation == 0 && c->screen_width == 0 &&
-           c->screen_height == 0;
+           c->screen_height == 0 && c->night_mode == 0 &&
+           c->screen_size == 0;
 }
 
 // Check if a config contradicts the device config (should be eliminated)
@@ -133,6 +164,15 @@ static bool config_contradicts_device(const DxResConfig *cfg, const DxDeviceConf
     }
     // SDK version: config requires higher SDK than device supports
     if (cfg->sdk_version > dev->sdk_version) {
+        return true;
+    }
+    // Night mode: if specified, must match device
+    if (cfg->night_mode != 0 && cfg->night_mode != dev->night_mode) {
+        return true;
+    }
+    // Screen size: if specified, must not exceed device screen size
+    if (cfg->screen_size != 0 && dev->screen_size != 0 &&
+        cfg->screen_size > dev->screen_size) {
         return true;
     }
     return false;
@@ -181,6 +221,17 @@ static int32_t config_match_score(const DxResConfig *cfg, const DxDeviceConfig *
     } else if (cfg->density == DX_DENSITY_NODPI) {
         // NODPI resources are density-independent, modest score
         score += 100;
+    }
+
+    // --- Night mode match (score 8 — between SDK and density) ---
+    if (cfg->night_mode != 0 && cfg->night_mode == dev->night_mode) {
+        score += 8;
+    }
+
+    // --- Screen size match (score 4 — prefer largest that fits) ---
+    if (cfg->screen_size != 0 && dev->screen_size != 0 &&
+        cfg->screen_size <= dev->screen_size) {
+        score += 4 + (int32_t)cfg->screen_size; // prefer closer match
     }
 
     // --- Orientation match bonus ---
@@ -276,6 +327,11 @@ static DxResult parse_string_pool(const uint8_t *data, uint32_t size, uint32_t p
     uint32_t strings_start = read_u32(data + pos + 20);
     bool is_utf8 = (flags & (1 << 8)) != 0;
 
+    // Integer overflow protection on string pool allocation
+    if (string_count > SIZE_MAX / sizeof(char *) - 1) {
+        DX_ERROR(TAG, "String pool count %u would overflow allocation", string_count);
+        return DX_ERR_INVALID_FORMAT;
+    }
     char **strings = (char **)dx_malloc(sizeof(char *) * (string_count + 1));
     if (!strings) return DX_ERR_OUT_OF_MEMORY;
 
@@ -398,6 +454,34 @@ static const DxStyleRecord *find_style_record(const DxResources *res, uint32_t s
     return NULL;
 }
 
+// Add an array resource record, growing if needed
+static bool add_array_resource(DxResources *res, const DxArrayResource *arr) {
+    if (res->array_count >= res->array_capacity) {
+        uint32_t new_cap = res->array_capacity == 0 ? INITIAL_ARRAY_CAPACITY : res->array_capacity * 2;
+        DxArrayResource *new_arrays = (DxArrayResource *)dx_realloc(
+            res->arrays, sizeof(DxArrayResource) * new_cap);
+        if (!new_arrays) return false;
+        res->arrays = new_arrays;
+        res->array_capacity = new_cap;
+    }
+    res->arrays[res->array_count++] = *arr;
+    return true;
+}
+
+// Add a plural resource record, growing if needed
+static bool add_plural_resource(DxResources *res, const DxPluralResource *pl) {
+    if (res->plural_count >= res->plural_capacity) {
+        uint32_t new_cap = res->plural_capacity == 0 ? INITIAL_PLURAL_CAPACITY : res->plural_capacity * 2;
+        DxPluralResource *new_plurals = (DxPluralResource *)dx_realloc(
+            res->plurals, sizeof(DxPluralResource) * new_cap);
+        if (!new_plurals) return false;
+        res->plurals = new_plurals;
+        res->plural_capacity = new_cap;
+    }
+    res->plurals[res->plural_count++] = *pl;
+    return true;
+}
+
 // Decode a float from raw uint32 bits
 static float decode_float(uint32_t raw) {
     union { uint32_t u; float f; } conv;
@@ -514,6 +598,8 @@ DxResult dx_resources_parse(const uint8_t *data, uint32_t size, DxResources **ou
 
                     bool is_string_type = (strcmp(type_name_str, "string") == 0);
                     bool is_layout_type = (strcmp(type_name_str, "layout") == 0);
+                    bool is_array_type = (strcmp(type_name_str, "array") == 0);
+                    bool is_plurals_type = (strcmp(type_name_str, "plurals") == 0);
                     uint32_t offsets_base = sub_pos + header_size;
                     uint32_t entries_base = sub_pos + entries_start;
 
@@ -568,6 +654,84 @@ DxResult dx_resources_parse(const uint8_t *data, uint32_t size, DxResources **ou
                                 map_pos += 12; // 4 + 8 bytes per map entry
                             }
 
+                            // --- Parse array resources (string-array, integer-array) ---
+                            if (is_array_type && valid_count > 0 && style_entries) {
+                                // Determine if string or integer array by checking first entry's value type
+                                bool is_str_arr = false;
+                                for (uint32_t a = 0; a < valid_count; a++) {
+                                    if (style_entries[a].value_type == RES_VALUE_TYPE_STRING) {
+                                        is_str_arr = true; break;
+                                    } else if (style_entries[a].value_type == RES_VALUE_TYPE_INT_DEC ||
+                                               style_entries[a].value_type == RES_VALUE_TYPE_INT_HEX) {
+                                        break;
+                                    }
+                                }
+
+                                DxArrayResource arr;
+                                memset(&arr, 0, sizeof(arr));
+                                arr.res_id = res_id;
+                                arr.count = valid_count;
+                                arr.is_string_array = is_str_arr;
+
+                                if (is_str_arr) {
+                                    arr.string_values = (char **)dx_malloc(sizeof(char *) * valid_count);
+                                    if (arr.string_values) {
+                                        for (uint32_t a = 0; a < valid_count; a++) {
+                                            if (style_entries[a].value_type == RES_VALUE_TYPE_STRING &&
+                                                style_entries[a].value_data < res->string_count && res->strings) {
+                                                arr.string_values[a] = dx_strdup(res->strings[style_entries[a].value_data]);
+                                            } else {
+                                                arr.string_values[a] = dx_strdup("");
+                                            }
+                                        }
+                                        add_array_resource(res, &arr);
+                                        DX_TRACE(TAG, "StringArray 0x%08x (%s): %u elements",
+                                                 res_id, key_name ? key_name : "?", valid_count);
+                                    }
+                                } else {
+                                    arr.int_values = (int32_t *)dx_malloc(sizeof(int32_t) * valid_count);
+                                    if (arr.int_values) {
+                                        for (uint32_t a = 0; a < valid_count; a++) {
+                                            arr.int_values[a] = (int32_t)style_entries[a].value_data;
+                                        }
+                                        add_array_resource(res, &arr);
+                                        DX_TRACE(TAG, "IntArray 0x%08x (%s): %u elements",
+                                                 res_id, key_name ? key_name : "?", valid_count);
+                                    }
+                                }
+                            }
+
+                            // --- Parse plural resources ---
+                            if (is_plurals_type && valid_count > 0 && style_entries) {
+                                DxPluralResource pl;
+                                memset(&pl, 0, sizeof(pl));
+                                pl.res_id = res_id;
+
+                                for (uint32_t a = 0; a < valid_count; a++) {
+                                    const char *str_val = NULL;
+                                    if (style_entries[a].value_type == RES_VALUE_TYPE_STRING &&
+                                        style_entries[a].value_data < res->string_count && res->strings) {
+                                        str_val = res->strings[style_entries[a].value_data];
+                                    }
+                                    if (!str_val) str_val = "";
+
+                                    switch (style_entries[a].attr_id) {
+                                        case PLURAL_KEY_ZERO:  pl.zero  = dx_strdup(str_val); break;
+                                        case PLURAL_KEY_ONE:   pl.one   = dx_strdup(str_val); break;
+                                        case PLURAL_KEY_TWO:   pl.two   = dx_strdup(str_val); break;
+                                        case PLURAL_KEY_FEW:   pl.few   = dx_strdup(str_val); break;
+                                        case PLURAL_KEY_MANY:  pl.many  = dx_strdup(str_val); break;
+                                        case PLURAL_KEY_OTHER: pl.other = dx_strdup(str_val); break;
+                                        default: break;
+                                    }
+                                }
+
+                                add_plural_resource(res, &pl);
+                                DX_TRACE(TAG, "Plural 0x%08x (%s): parsed",
+                                         res_id, key_name ? key_name : "?");
+                            }
+
+                            // Store as style record too (for styles/themes)
                             if (style_entries && valid_count > 0) {
                                 add_style_record(res, res_id, parent_ref,
                                                  style_entries, valid_count);
@@ -717,9 +881,9 @@ DxResult dx_resources_parse(const uint8_t *data, uint32_t size, DxResources **ou
         pos += chunk_size;
     }
 
-    DX_INFO(TAG, "Resources parsed: %u strings, %u string entries, %u layout entries, %u total entries, %u styles",
+    DX_INFO(TAG, "Resources parsed: %u strings, %u string entries, %u layout entries, %u total entries, %u styles, %u arrays, %u plurals",
             res->string_count, res->string_entry_count, res->layout_entry_count, res->entry_count,
-            res->style_count);
+            res->style_count, res->array_count, res->plural_count);
     *out = res;
     return DX_OK;
 
@@ -748,6 +912,31 @@ void dx_resources_free(DxResources *res) {
         dx_free(res->styles[i].entries);
     }
     dx_free(res->styles);
+
+    // Free array resources
+    for (uint32_t i = 0; i < res->array_count; i++) {
+        DxArrayResource *a = &res->arrays[i];
+        if (a->string_values) {
+            for (uint32_t j = 0; j < a->count; j++) {
+                dx_free(a->string_values[j]);
+            }
+            dx_free(a->string_values);
+        }
+        dx_free(a->int_values);
+    }
+    dx_free(res->arrays);
+
+    // Free plural resources
+    for (uint32_t i = 0; i < res->plural_count; i++) {
+        DxPluralResource *p = &res->plurals[i];
+        dx_free(p->zero);
+        dx_free(p->one);
+        dx_free(p->two);
+        dx_free(p->few);
+        dx_free(p->many);
+        dx_free(p->other);
+    }
+    dx_free(res->plurals);
 
     // Free general entry table
     for (uint32_t i = 0; i < res->entry_count; i++) {
@@ -869,6 +1058,75 @@ char *dx_resources_format_color(uint32_t argb) {
     char buf[16];
     snprintf(buf, sizeof(buf), "#%08X", argb);
     return dx_strdup(buf);
+}
+
+// ============================================================
+// Array resource lookup
+// ============================================================
+
+const DxArrayResource *dx_resources_find_array(const DxResources *res, uint32_t res_id) {
+    if (!res) return NULL;
+    for (uint32_t i = 0; i < res->array_count; i++) {
+        if (res->arrays[i].res_id == res_id) {
+            return &res->arrays[i];
+        }
+    }
+    return NULL;
+}
+
+const char **dx_resources_get_string_array(const DxResources *res, uint32_t res_id, uint32_t *out_count) {
+    if (out_count) *out_count = 0;
+    const DxArrayResource *arr = dx_resources_find_array(res, res_id);
+    if (!arr || !arr->is_string_array || !arr->string_values) return NULL;
+    if (out_count) *out_count = arr->count;
+    return (const char **)arr->string_values;
+}
+
+const int32_t *dx_resources_get_integer_array(const DxResources *res, uint32_t res_id, uint32_t *out_count) {
+    if (out_count) *out_count = 0;
+    const DxArrayResource *arr = dx_resources_find_array(res, res_id);
+    if (!arr || arr->is_string_array || !arr->int_values) return NULL;
+    if (out_count) *out_count = arr->count;
+    return arr->int_values;
+}
+
+// ============================================================
+// Plural resource lookup
+// ============================================================
+
+const char *dx_resources_get_plural(const DxResources *res, uint32_t res_id, int quantity) {
+    if (!res) return NULL;
+
+    const DxPluralResource *pl = NULL;
+    for (uint32_t i = 0; i < res->plural_count; i++) {
+        if (res->plurals[i].res_id == res_id) {
+            pl = &res->plurals[i];
+            break;
+        }
+    }
+    if (!pl) return NULL;
+
+    // CLDR English quantity rules: 1 = "one", everything else = "other"
+    // Also check explicit zero, two, few, many forms
+    const char *result = NULL;
+    if (quantity == 0 && pl->zero) {
+        result = pl->zero;
+    } else if (quantity == 1 && pl->one) {
+        result = pl->one;
+    } else if (quantity == 2 && pl->two) {
+        result = pl->two;
+    }
+
+    // Fallback to "other" if no specific form matched
+    if (!result && pl->other) {
+        result = pl->other;
+    }
+    // Last resort: try "many" or "few"
+    if (!result) result = pl->many;
+    if (!result) result = pl->few;
+    if (!result) result = pl->one;
+
+    return result;
 }
 
 // ============================================================

@@ -125,6 +125,40 @@ typedef struct {
     uint32_t            virtual_methods_count;
 } DxDexClassData;
 
+// Method handle kinds (from DEX spec)
+typedef enum {
+    DX_METHOD_HANDLE_STATIC_PUT      = 0x00,
+    DX_METHOD_HANDLE_STATIC_GET      = 0x01,
+    DX_METHOD_HANDLE_INSTANCE_PUT    = 0x02,
+    DX_METHOD_HANDLE_INSTANCE_GET    = 0x03,
+    DX_METHOD_HANDLE_INVOKE_STATIC   = 0x04,
+    DX_METHOD_HANDLE_INVOKE_INSTANCE = 0x05,
+    DX_METHOD_HANDLE_INVOKE_CONSTRUCTOR = 0x06,
+    DX_METHOD_HANDLE_INVOKE_DIRECT   = 0x07,
+    DX_METHOD_HANDLE_INVOKE_INTERFACE = 0x08,
+} DxMethodHandleKind;
+
+// Method handle item (parsed from method_handle_item section)
+typedef struct {
+    uint16_t method_handle_type;    // DxMethodHandleKind
+    uint16_t field_or_method_id;    // index into field_ids or method_ids
+} DxMethodHandle;
+
+// Call site item (parsed from call_site_id + encoded_array_item)
+typedef struct {
+    uint32_t method_handle_idx;     // bootstrap method handle index
+    const char *method_name;        // functional interface method name
+    uint32_t proto_idx;             // erased method type (proto_ids index)
+    // For LambdaMetafactory additional args:
+    uint32_t target_proto_idx;      // instantiated method type
+    uint32_t impl_method_idx;       // implementation method (method_ids index)
+    uint32_t impl_kind;             // implementation method handle kind
+    // For StringConcatFactory:
+    const char *concat_recipe;      // recipe string (NULL if not StringConcat)
+    bool is_string_concat;          // true if bootstrap is StringConcatFactory
+    bool parsed;                    // true if successfully parsed
+} DxCallSite;
+
 // Complete parsed DEX file
 struct DxDexFile {
     const uint8_t  *raw_data;
@@ -153,6 +187,14 @@ struct DxDexFile {
 
     // Parsed class data (lazy, indexed by class_def index)
     DxDexClassData **class_data;    // array of pointers, NULL until parsed
+
+    // Method handles (from method_handle_item section in map list)
+    DxMethodHandle *method_handles;
+    uint32_t        method_handle_count;
+
+    // Call sites (from call_site_id_item section in map list)
+    DxCallSite     *call_sites;
+    uint32_t        call_site_count;
 };
 
 // Parse a DEX file from a buffer (buffer must remain valid)
@@ -199,10 +241,45 @@ const char *dx_dex_get_method_return_type(const DxDexFile *dex, uint32_t method_
 DxResult dx_dex_parse_static_values(const DxDexFile *dex, uint32_t offset,
                                      DxValue *out_values, uint32_t max_count);
 
-// Annotation entry (type descriptor + visibility)
+// Annotation element value types
+typedef enum {
+    DX_ANNO_VAL_NONE = 0,     // not set / unsupported
+    DX_ANNO_VAL_BYTE,
+    DX_ANNO_VAL_SHORT,
+    DX_ANNO_VAL_CHAR,
+    DX_ANNO_VAL_INT,
+    DX_ANNO_VAL_LONG,
+    DX_ANNO_VAL_FLOAT,
+    DX_ANNO_VAL_DOUBLE,
+    DX_ANNO_VAL_STRING,       // value stored in str_value
+    DX_ANNO_VAL_TYPE,         // type descriptor in str_value
+    DX_ANNO_VAL_ENUM,         // enum field name in str_value, enum class in extra_str
+    DX_ANNO_VAL_BOOLEAN,
+    DX_ANNO_VAL_NULL,
+    DX_ANNO_VAL_ARRAY,        // stub — element_count in i_value
+    DX_ANNO_VAL_ANNOTATION,   // stub — nested annotation
+} DxAnnotationValueType;
+
+// A single name-value pair in an annotation
 typedef struct {
-    const char *type;       // annotation type descriptor e.g. "Lretrofit2/http/GET;"
-    uint8_t     visibility; // 0=BUILD, 1=RUNTIME, 2=SYSTEM
+    const char             *name;       // element name (e.g., "value", "method", "path")
+    DxAnnotationValueType   val_type;
+    union {
+        int32_t     i_value;            // byte, short, char, int, boolean
+        int64_t     l_value;            // long
+        float       f_value;            // float
+        double      d_value;            // double
+    };
+    const char             *str_value;  // string/type/enum value (points into DEX string table)
+    const char             *extra_str;  // enum class descriptor
+} DxAnnotationElement;
+
+// Annotation entry (type descriptor + visibility + element values)
+typedef struct {
+    const char           *type;           // annotation type descriptor e.g. "Lretrofit2/http/GET;"
+    uint8_t               visibility;     // 0=BUILD, 1=RUNTIME, 2=SYSTEM
+    DxAnnotationElement  *elements;       // array of name-value pairs (heap-allocated)
+    uint32_t              element_count;  // number of elements
 } DxAnnotationEntry;
 
 // Parsed annotations directory for a class_def
@@ -233,5 +310,37 @@ DxResult dx_dex_parse_annotations(const DxDexFile *dex, uint32_t annotations_off
 
 // Free a parsed annotations directory
 void dx_dex_free_annotations(DxAnnotationsDirectory *dir);
+
+// Parse method handles and call sites from DEX map list (called during dx_dex_parse)
+DxResult dx_dex_parse_call_sites(DxDexFile *dex);
+
+// Get a call site by index (returns NULL if index out of range or not parsed)
+const DxCallSite *dx_dex_get_call_site(const DxDexFile *dex, uint32_t call_site_idx);
+
+// ── Annotation element lookup helpers ──
+
+// Get a string element value from an annotation (returns NULL if not found or wrong type)
+const char *dx_annotation_get_string(const DxAnnotationEntry *ann, const char *element_name);
+
+// Get an int element value from an annotation (returns default_val if not found)
+int32_t dx_annotation_get_int(const DxAnnotationEntry *ann, const char *element_name, int32_t default_val);
+
+// Get a long element value
+int64_t dx_annotation_get_long(const DxAnnotationEntry *ann, const char *element_name, int64_t default_val);
+
+// Get a float element value
+float dx_annotation_get_float(const DxAnnotationEntry *ann, const char *element_name, float default_val);
+
+// Get a double element value
+double dx_annotation_get_double(const DxAnnotationEntry *ann, const char *element_name, double default_val);
+
+// Get a boolean element value
+bool dx_annotation_get_bool(const DxAnnotationEntry *ann, const char *element_name, bool default_val);
+
+// Get a type descriptor element value (returns NULL if not found)
+const char *dx_annotation_get_type(const DxAnnotationEntry *ann, const char *element_name);
+
+// Free annotation elements (call when freeing DxAnnotationEntry)
+void dx_annotation_entry_free_elements(DxAnnotationEntry *entry);
 
 #endif // DX_DEX_H

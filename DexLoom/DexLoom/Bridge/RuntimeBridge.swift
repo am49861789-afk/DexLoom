@@ -71,6 +71,30 @@ struct ConstraintAnchors {
     var hasAny: Bool { hasHorizontal || hasVertical }
 }
 
+/// A single recorded Canvas draw command, mirroring C DxDrawCommand
+struct DrawCommand: Identifiable {
+    let id = UUID()
+    let type: DxDrawCmdType
+    let params: (Float, Float, Float, Float, Float, Float)
+    let color: UInt32
+    let strokeWidth: Float
+    let paintStyle: Int32   // 0=FILL, 1=STROKE, 2=FILL_AND_STROKE
+    let textSize: Float
+    let text: String?
+}
+
+/// Shape drawable background properties (parsed from shape XML)
+struct ShapeBackground {
+    let shapeType: UInt8       // 0=rectangle, 1=oval, 2=line, 3=ring
+    let solidColor: UInt32     // ARGB
+    let cornerRadius: Float    // dp
+    let strokeWidth: Float     // dp
+    let strokeColor: UInt32    // ARGB
+    let gradientStart: UInt32  // ARGB
+    let gradientEnd: UInt32    // ARGB
+    let gradientType: UInt8    // 0=linear, 1=radial, 2=sweep
+}
+
 struct RenderNode: Identifiable {
     let id = UUID()
     let type: DxViewType
@@ -88,6 +112,9 @@ struct RenderNode: Identifiable {
     let bgColor: UInt32
     let textColor: UInt32
     let isChecked: Bool
+    let inputType: UInt32         // android:inputType value
+    let scaleType: UInt8          // 0=fitCenter, 1=center, 2=centerCrop, 3=centerInside, 4=fitXY, 5=fitStart, 6=fitEnd
+    let visibility: DxVisibility  // VISIBLE=0, INVISIBLE=4, GONE=8
     let hasClickListener: Bool
     let hasLongClickListener: Bool
     let hasRefreshListener: Bool
@@ -98,8 +125,20 @@ struct RenderNode: Identifiable {
     let relRightOf: UInt32        // layout_toRightOf view ID
     let constraints: ConstraintAnchors  // ConstraintLayout constraints
     let imageData: Data?          // PNG/JPEG bytes for ImageView
+    let isNinePatch: Bool         // true if image is a compiled 9-patch PNG
+    let ninePatchPadding: (Int32, Int32, Int32, Int32)   // left, top, right, bottom content padding
+    let ninePatchStretchX: (Int32, Int32)                // start, end of horizontal stretch region
+    let ninePatchStretchY: (Int32, Int32)                // start, end of vertical stretch region
+    let vectorPathData: String?   // SVG path data for vector drawable
+    let vectorFillColor: UInt32   // ARGB fill color for vector drawable
+    let vectorStrokeColor: UInt32 // ARGB stroke color for vector drawable
+    let vectorStrokeWidth: Float  // stroke width for vector drawable
+    let vectorWidth: Float        // viewport width for vector drawable
+    let vectorHeight: Float       // viewport height for vector drawable
+    let shapeBg: ShapeBackground?  // Shape drawable background
     let webURL: String?           // URL for WebView
     let webHTML: String?          // HTML content for WebView
+    let drawCommands: [DrawCommand]  // Canvas draw commands
     let children: [RenderNode]
 }
 
@@ -125,6 +164,101 @@ final class RuntimeBridge: ObservableObject {
 
     init() {
         addLog(level: "INFO", tag: "Bridge", message: "DexLoom runtime bridge initialized")
+        RuntimeBridge.setupNetworkBridge()
+    }
+
+    /// Install the C-to-Swift network callback for real HTTP requests via URLSession
+    private static func setupNetworkBridge() {
+        dx_runtime_set_network_callback { (request: UnsafePointer<DxNetworkRequest>?) -> DxNetworkResponse in
+            guard let request = request, let urlCStr = request.pointee.url else {
+                return DxNetworkResponse(status_code: -1, body: nil, body_size: 0,
+                                         header_names: nil, header_values: nil, header_count: 0)
+            }
+
+            let urlString = String(cString: urlCStr)
+            guard let url = URL(string: urlString) else {
+                return DxNetworkResponse(status_code: -1, body: nil, body_size: 0,
+                                         header_names: nil, header_values: nil, header_count: 0)
+            }
+
+            var urlRequest = URLRequest(url: url)
+
+            // Set HTTP method
+            if let methodPtr = request.pointee.method {
+                urlRequest.httpMethod = String(cString: methodPtr)
+            }
+
+            // Set request headers
+            let headerCount = Int(request.pointee.header_count)
+            if headerCount > 0,
+               let names = request.pointee.header_names,
+               let values = request.pointee.header_values {
+                for i in 0..<headerCount {
+                    if let namePtr = names[i], let valPtr = values[i] {
+                        let name = String(cString: namePtr)
+                        let value = String(cString: valPtr)
+                        urlRequest.setValue(value, forHTTPHeaderField: name)
+                    }
+                }
+            }
+
+            // Set request body
+            if request.pointee.body_size > 0, let bodyPtr = request.pointee.body {
+                urlRequest.httpBody = Data(bytes: bodyPtr, count: request.pointee.body_size)
+            }
+
+            // Perform synchronous request using semaphore
+            let semaphore = DispatchSemaphore(value: 0)
+            var responseData: Data?
+            var httpResponse: HTTPURLResponse?
+
+            let task = URLSession.shared.dataTask(with: urlRequest) { data, response, error in
+                responseData = data
+                httpResponse = response as? HTTPURLResponse
+                semaphore.signal()
+            }
+            task.resume()
+            semaphore.wait()
+
+            // Build C response
+            let statusCode = Int32(httpResponse?.statusCode ?? -1)
+
+            // Copy response body
+            var bodyPtr: UnsafeMutablePointer<UInt8>? = nil
+            var bodySize: Int = 0
+            if let data = responseData, !data.isEmpty {
+                bodySize = data.count
+                bodyPtr = UnsafeMutablePointer<UInt8>.allocate(capacity: bodySize)
+                data.copyBytes(to: bodyPtr!, count: bodySize)
+            }
+
+            // Copy response headers
+            var hdrNamesPtrPtr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>? = nil
+            var hdrValuesPtrPtr: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>? = nil
+            var hdrCount: Int32 = 0
+
+            if let allHeaders = httpResponse?.allHeaderFields as? [String: String], !allHeaders.isEmpty {
+                let count = allHeaders.count
+                hdrCount = Int32(count)
+                hdrNamesPtrPtr = .allocate(capacity: count)
+                hdrValuesPtrPtr = .allocate(capacity: count)
+                var idx = 0
+                for (key, value) in allHeaders {
+                    hdrNamesPtrPtr![idx] = strdup(key)
+                    hdrValuesPtrPtr![idx] = strdup(value)
+                    idx += 1
+                }
+            }
+
+            return DxNetworkResponse(
+                status_code: statusCode,
+                body: bodyPtr,
+                body_size: bodySize,
+                header_names: hdrNamesPtrPtr,
+                header_values: hdrValuesPtrPtr,
+                header_count: hdrCount
+            )
+        }
     }
 
     deinit {
@@ -466,6 +600,36 @@ final class RuntimeBridge: ObservableObject {
             verticalBias: ca.vertical_bias
         )
 
+        // Convert draw commands
+        var drawCmds: [DrawCommand] = []
+        if n.draw_cmd_count > 0, let cmdPtr = n.draw_commands {
+            for i in 0..<Int(n.draw_cmd_count) {
+                let c = cmdPtr.advanced(by: i).pointee
+                let txt: String? = c.text.map { String(cString: $0) }
+                drawCmds.append(DrawCommand(
+                    type: c.type,
+                    params: c.params,
+                    color: c.color,
+                    strokeWidth: c.stroke_width,
+                    paintStyle: c.paint_style,
+                    textSize: c.text_size,
+                    text: txt
+                ))
+            }
+        }
+
+        // Extract shape drawable background if present
+        let shapeBg: ShapeBackground? = n.shape_bg.has_shape ? ShapeBackground(
+            shapeType: n.shape_bg.shape_type,
+            solidColor: n.shape_bg.solid_color,
+            cornerRadius: n.shape_bg.corner_radius,
+            strokeWidth: n.shape_bg.stroke_width,
+            strokeColor: n.shape_bg.stroke_color,
+            gradientStart: n.shape_bg.gradient_start,
+            gradientEnd: n.shape_bg.gradient_end,
+            gradientType: n.shape_bg.gradient_type
+        ) : nil
+
         return RenderNode(
             type: n.type,
             viewId: n.view_id,
@@ -482,6 +646,9 @@ final class RuntimeBridge: ObservableObject {
             bgColor: n.bg_color,
             textColor: n.text_color,
             isChecked: n.is_checked,
+            inputType: n.input_type,
+            scaleType: n.scale_type,
+            visibility: n.visibility,
             hasClickListener: n.has_click_listener,
             hasLongClickListener: n.has_long_click_listener,
             hasRefreshListener: n.has_refresh_listener,
@@ -492,8 +659,21 @@ final class RuntimeBridge: ObservableObject {
             relRightOf: n.rel_right_of,
             constraints: anchors,
             imageData: imgData,
+            isNinePatch: n.is_nine_patch,
+            ninePatchPadding: (n.nine_patch_padding.0, n.nine_patch_padding.1,
+                               n.nine_patch_padding.2, n.nine_patch_padding.3),
+            ninePatchStretchX: (n.nine_patch_stretch_x.0, n.nine_patch_stretch_x.1),
+            ninePatchStretchY: (n.nine_patch_stretch_y.0, n.nine_patch_stretch_y.1),
+            vectorPathData: n.vector_path_data.map { String(cString: $0) },
+            vectorFillColor: n.vector_fill_color,
+            vectorStrokeColor: n.vector_stroke_color,
+            vectorStrokeWidth: n.vector_stroke_width,
+            vectorWidth: n.vector_width,
+            vectorHeight: n.vector_height,
+            shapeBg: shapeBg,
             webURL: n.web_url.map { String(cString: $0) },
             webHTML: n.web_html.map { String(cString: $0) },
+            drawCommands: drawCmds,
             children: children
         )
     }

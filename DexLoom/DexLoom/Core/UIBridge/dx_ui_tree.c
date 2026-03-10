@@ -110,6 +110,7 @@ void dx_ui_node_destroy(DxUINode *node) {
     dx_free(node->text);
     dx_free(node->hint);
     dx_free(node->image_data);
+    dx_free(node->vector_path_data);
     dx_free(node->web_url);
     dx_free(node->web_html);
     if (node->draw_commands) {
@@ -338,6 +339,8 @@ static DxRenderNode *serialize_node(DxUINode *node) {
     rn->bg_color = node->bg_color;
     rn->text_color = node->text_color;
     rn->is_checked = node->is_checked;
+    rn->input_type = node->input_type;
+    rn->scale_type = node->scale_type;
     rn->has_click_listener = (node->click_listener != NULL);
     rn->has_long_click_listener = (node->long_click_listener != NULL);
     rn->has_refresh_listener = (node->refresh_listener != NULL);
@@ -349,6 +352,17 @@ static DxRenderNode *serialize_node(DxUINode *node) {
     rn->constraints = node->constraints;
     rn->image_data = node->image_data;        // borrow pointer (DxUINode owns the data)
     rn->image_data_len = node->image_data_len;
+    rn->is_nine_patch = node->is_nine_patch;
+    memcpy(rn->nine_patch_padding, node->nine_patch_padding, sizeof(rn->nine_patch_padding));
+    memcpy(rn->nine_patch_stretch_x, node->nine_patch_stretch_x, sizeof(rn->nine_patch_stretch_x));
+    memcpy(rn->nine_patch_stretch_y, node->nine_patch_stretch_y, sizeof(rn->nine_patch_stretch_y));
+    rn->vector_path_data = node->vector_path_data ? dx_strdup(node->vector_path_data) : NULL;
+    rn->vector_fill_color = node->vector_fill_color;
+    rn->vector_stroke_color = node->vector_stroke_color;
+    rn->vector_stroke_width = node->vector_stroke_width;
+    rn->vector_width = node->vector_width;
+    rn->vector_height = node->vector_height;
+    rn->shape_bg = node->shape_bg;
     rn->web_url = node->web_url ? dx_strdup(node->web_url) : NULL;
     rn->web_html = node->web_html ? dx_strdup(node->web_html) : NULL;
 
@@ -405,6 +419,7 @@ static void free_render_node(DxRenderNode *node) {
     if (!node) return;
     dx_free(node->text);
     dx_free(node->hint);
+    dx_free(node->vector_path_data);
     dx_free(node->web_url);
     dx_free(node->web_html);
     if (node->draw_commands) {
@@ -472,6 +487,8 @@ void dx_render_model_destroy(DxRenderModel *model) {
 #define ATTR_LAYOUT_MARGIN_START 0x010103b5
 #define ATTR_LAYOUT_MARGIN_END   0x010103b6
 #define ATTR_SRC           0x01010119  // android:src (ImageView drawable)
+#define ATTR_INPUT_TYPE    0x01010006  // android:inputType
+#define ATTR_SCALE_TYPE    0x0101011d  // android:scaleType
 
 // Style attribute
 #define ATTR_STYLE         0x010100ba  // android:style (but style is often attr index 0xFFFFFFFF)
@@ -508,31 +525,1130 @@ static uint32_t read_u32(const uint8_t *p) {
     return (uint32_t)(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24));
 }
 
-// Try to extract a drawable image from the APK for a given resource ID.
-// Looks up the resource entry to get the file path, then extracts from APK.
-// Returns allocated image bytes (caller owns), or NULL on failure.
-static uint8_t *dx_ui_extract_drawable(DxContext *ctx, uint32_t res_id, uint32_t *out_len) {
+// ============================================================
+// Vector drawable AXML parser
+// ============================================================
+
+// Parse a vector drawable from compiled binary XML (AXML format).
+// Extracts pathData, fillColor, strokeColor, strokeWidth, viewportWidth/Height.
+// Concatenates all <path> elements' pathData into a single string.
+// Returns true on success, populating the output parameters.
+static bool dx_ui_parse_vector_drawable(const uint8_t *data, uint32_t size,
+                                         char **out_path_data,
+                                         uint32_t *out_fill_color,
+                                         uint32_t *out_stroke_color,
+                                         float *out_stroke_width,
+                                         float *out_vp_width,
+                                         float *out_vp_height) {
+    if (!data || size < 12) return false;
+
+    // Verify AXML magic
+    uint32_t magic = read_u32(data);
+    if (magic != AXML_FILE_MAGIC) return false;
+
+    // Parse string pool
+    uint32_t offset = 8;  // skip magic + file_size
+    if (offset + 8 > size) return false;
+
+    uint16_t sp_type = read_u16(data + offset);
+    if (sp_type != AXML_CHUNK_STRINGPOOL) return false;
+
+    uint32_t sp_size = read_u32(data + offset + 4);
+    uint32_t sp_string_count = read_u32(data + offset + 8);
+    if (sp_string_count > AXML_MAX_STRING_POOL || sp_string_count == 0) return false;
+
+    uint32_t sp_flags = read_u32(data + offset + 16);
+    bool is_utf8 = (sp_flags & (1u << 8)) != 0;
+    uint32_t strings_start = read_u32(data + offset + 20);
+    uint32_t sp_base = offset + 28;  // start of string offset table
+
+    // Build string pool index (reuse same approach as layout parser)
+    uint32_t max_strings = sp_string_count < 4096 ? sp_string_count : 4096;
+    const char **string_pool = (const char **)dx_malloc(sizeof(char *) * max_strings);
+    char **string_pool_alloc = (char **)dx_malloc(sizeof(char *) * max_strings);
+    if (!string_pool || !string_pool_alloc) {
+        dx_free(string_pool);
+        dx_free(string_pool_alloc);
+        return false;
+    }
+    memset(string_pool, 0, sizeof(char *) * max_strings);
+    memset(string_pool_alloc, 0, sizeof(char *) * max_strings);
+
+    for (uint32_t i = 0; i < max_strings; i++) {
+        if (sp_base + i * 4 + 4 > offset + sp_size) break;
+        uint32_t str_offset = read_u32(data + sp_base + i * 4);
+        uint32_t abs_offset = offset + strings_start + str_offset;
+        if (abs_offset + 2 > size) continue;
+
+        if (is_utf8) {
+            // UTF-8: skip char count (1-2 bytes), then byte length (1-2 bytes), then data
+            uint32_t p = abs_offset;
+            // Skip char count
+            if (p >= size) continue;
+            if (data[p] & 0x80) p += 2; else p += 1;
+            if (p >= size) continue;
+            // Read byte length
+            uint32_t byte_len;
+            if (data[p] & 0x80) {
+                if (p + 1 >= size) continue;
+                byte_len = ((data[p] & 0x7F) << 8) | data[p + 1];
+                p += 2;
+            } else {
+                byte_len = data[p];
+                p += 1;
+            }
+            if (p + byte_len > size) continue;
+            char *s = (char *)dx_malloc(byte_len + 1);
+            if (s) {
+                memcpy(s, data + p, byte_len);
+                s[byte_len] = '\0';
+                string_pool[i] = s;
+                string_pool_alloc[i] = s;
+            }
+        } else {
+            // UTF-16LE
+            if (abs_offset + 2 > size) continue;
+            uint32_t char_count = read_u16(data + abs_offset);
+            uint32_t p = abs_offset + 2;
+            if (p + char_count * 2 > size) continue;
+            // Simple ASCII extraction from UTF-16
+            char *s = (char *)dx_malloc(char_count + 1);
+            if (s) {
+                for (uint32_t c = 0; c < char_count; c++) {
+                    uint16_t ch = read_u16(data + p + c * 2);
+                    s[c] = (ch < 128) ? (char)ch : '?';
+                }
+                s[char_count] = '\0';
+                string_pool[i] = s;
+                string_pool_alloc[i] = s;
+            }
+        }
+    }
+
+    // Parse resource ID map (skip it)
+    uint32_t pos = offset + sp_size;
+    uint32_t *res_ids = NULL;
+    uint32_t res_id_count = 0;
+    if (pos + 8 <= size) {
+        uint16_t chunk_type = read_u16(data + pos);
+        if (chunk_type == AXML_CHUNK_RESOURCEMAP) {
+            uint32_t chunk_size = read_u32(data + pos + 4);
+            res_id_count = (chunk_size - 8) / 4;
+            if (res_id_count > 0 && pos + 8 + res_id_count * 4 <= size) {
+                res_ids = (uint32_t *)dx_malloc(sizeof(uint32_t) * res_id_count);
+                if (res_ids) {
+                    for (uint32_t i = 0; i < res_id_count; i++) {
+                        res_ids[i] = read_u32(data + pos + 8 + i * 4);
+                    }
+                }
+            }
+            pos += chunk_size;
+        }
+    }
+
+    // Accumulate path data from all <path> elements
+    // Use a dynamic buffer
+    size_t path_buf_cap = 1024;
+    size_t path_buf_len = 0;
+    char *path_buf = (char *)dx_malloc(path_buf_cap);
+    if (!path_buf) path_buf_cap = 0;
+
+    // Default values
+    uint32_t fill_color = 0xFF000000;   // opaque black
+    uint32_t stroke_color = 0;
+    float stroke_width = 0.0f;
+    float vp_width = 24.0f;
+    float vp_height = 24.0f;
+    bool found_vector = false;
+    bool found_path = false;
+
+    // Well-known vector drawable attribute resource IDs
+    #define VD_ATTR_VIEWPORT_WIDTH   0x01010489
+    #define VD_ATTR_VIEWPORT_HEIGHT  0x0101048a
+    #define VD_ATTR_PATH_DATA        0x01010405
+    #define VD_ATTR_FILL_COLOR       0x0101031f
+    #define VD_ATTR_STROKE_COLOR     0x01010321
+    #define VD_ATTR_STROKE_WIDTH     0x01010322
+
+    // Walk the AXML chunks looking for START_TAG events
+    while (pos + 8 <= size) {
+        uint16_t chunk_type = read_u16(data + pos);
+        uint32_t chunk_size = read_u32(data + pos + 4);
+        if (chunk_size < 8 || pos + chunk_size > size) break;
+
+        if (chunk_type == AXML_CHUNK_START_TAG && chunk_size >= 36) {
+            // Parse start tag
+            uint32_t name_idx = read_u32(data + pos + 20);
+            uint32_t attr_count = read_u16(data + pos + 28);
+            uint32_t attr_start = pos + 36;
+
+            const char *tag_name = NULL;
+            if (name_idx < max_strings) tag_name = string_pool[name_idx];
+
+            bool is_vector = (tag_name && strcmp(tag_name, "vector") == 0);
+            bool is_path = (tag_name && strcmp(tag_name, "path") == 0);
+
+            // Process attributes
+            for (uint32_t a = 0; a < attr_count; a++) {
+                uint32_t aoff = attr_start + a * 20;
+                if (aoff + 20 > size) break;
+
+                uint32_t attr_name_idx = read_u32(data + aoff + 4);
+                uint8_t  attr_type = data[aoff + 11];
+                uint32_t attr_data = read_u32(data + aoff + 16);
+
+                // Determine attribute resource ID
+                uint32_t attr_res_id = 0;
+                if (attr_name_idx < res_id_count && res_ids) {
+                    attr_res_id = res_ids[attr_name_idx];
+                }
+
+                const char *attr_name = NULL;
+                if (attr_name_idx < max_strings) attr_name = string_pool[attr_name_idx];
+
+                if (is_vector) {
+                    found_vector = true;
+                    if (attr_res_id == VD_ATTR_VIEWPORT_WIDTH ||
+                        (attr_name && strcmp(attr_name, "viewportWidth") == 0)) {
+                        // Float type (0x04)
+                        if (attr_type == 0x04) {
+                            float f;
+                            memcpy(&f, &attr_data, sizeof(float));
+                            vp_width = f;
+                        } else {
+                            vp_width = (float)attr_data;
+                        }
+                    }
+                    else if (attr_res_id == VD_ATTR_VIEWPORT_HEIGHT ||
+                             (attr_name && strcmp(attr_name, "viewportHeight") == 0)) {
+                        if (attr_type == 0x04) {
+                            float f;
+                            memcpy(&f, &attr_data, sizeof(float));
+                            vp_height = f;
+                        } else {
+                            vp_height = (float)attr_data;
+                        }
+                    }
+                }
+                else if (is_path) {
+                    found_path = true;
+                    if (attr_res_id == VD_ATTR_FILL_COLOR ||
+                        (attr_name && strcmp(attr_name, "fillColor") == 0)) {
+                        fill_color = attr_data;
+                    }
+                    else if (attr_res_id == VD_ATTR_STROKE_COLOR ||
+                             (attr_name && strcmp(attr_name, "strokeColor") == 0)) {
+                        stroke_color = attr_data;
+                    }
+                    else if (attr_res_id == VD_ATTR_STROKE_WIDTH ||
+                             (attr_name && strcmp(attr_name, "strokeWidth") == 0)) {
+                        if (attr_type == 0x04) {
+                            memcpy(&stroke_width, &attr_data, sizeof(float));
+                        } else {
+                            stroke_width = (float)attr_data;
+                        }
+                    }
+                    else if (attr_res_id == VD_ATTR_PATH_DATA ||
+                             (attr_name && strcmp(attr_name, "pathData") == 0)) {
+                        // pathData is a string reference (type 0x03)
+                        const char *pd = NULL;
+                        if (attr_type == 0x03 && attr_data < max_strings) {
+                            pd = string_pool[attr_data];
+                        }
+                        // Also try raw_value (offset+12 in attribute)
+                        if (!pd) {
+                            uint32_t raw_val = read_u32(data + aoff + 8);
+                            if (raw_val < max_strings) {
+                                pd = string_pool[raw_val];
+                            }
+                        }
+                        if (pd && path_buf) {
+                            size_t pd_len = strlen(pd);
+                            // If we already have data, add a space separator
+                            if (path_buf_len > 0) {
+                                if (path_buf_len + 1 >= path_buf_cap) {
+                                    path_buf_cap *= 2;
+                                    char *nb = (char *)dx_realloc(path_buf, path_buf_cap);
+                                    if (!nb) { dx_free(path_buf); path_buf = NULL; path_buf_cap = 0; break; }
+                                    path_buf = nb;
+                                }
+                                path_buf[path_buf_len++] = ' ';
+                            }
+                            while (path_buf_len + pd_len + 1 > path_buf_cap) {
+                                path_buf_cap *= 2;
+                                char *nb = (char *)dx_realloc(path_buf, path_buf_cap);
+                                if (!nb) { dx_free(path_buf); path_buf = NULL; path_buf_cap = 0; break; }
+                                path_buf = nb;
+                            }
+                            if (path_buf) {
+                                memcpy(path_buf + path_buf_len, pd, pd_len);
+                                path_buf_len += pd_len;
+                                path_buf[path_buf_len] = '\0';
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        pos += chunk_size;
+    }
+
+    // Cleanup
+    for (uint32_t i = 0; i < max_strings; i++) {
+        dx_free(string_pool_alloc[i]);
+    }
+    dx_free(string_pool);
+    dx_free(string_pool_alloc);
+    dx_free(res_ids);
+
+    if (found_vector && found_path && path_buf && path_buf_len > 0) {
+        *out_path_data = path_buf;
+        *out_fill_color = fill_color;
+        *out_stroke_color = stroke_color;
+        *out_stroke_width = stroke_width;
+        *out_vp_width = vp_width;
+        *out_vp_height = vp_height;
+        DX_INFO(TAG, "Parsed vector drawable: viewport=%.0fx%.0f, fill=0x%08x, pathLen=%zu",
+                vp_width, vp_height, fill_color, path_buf_len);
+        return true;
+    }
+
+    dx_free(path_buf);
+    return false;
+}
+
+// Well-known attribute resource IDs for shape/selector/layer-list drawables
+#define SHAPE_ATTR_SHAPE       0x01010000  // android:shape
+#define SHAPE_ATTR_COLOR       0x010101a5  // android:color (for <solid>)
+#define SHAPE_ATTR_RADIUS      0x01010101  // android:radius (for <corners>)
+#define SHAPE_ATTR_WIDTH       0x01010159  // android:width (for <stroke>/<size>)
+#define SHAPE_ATTR_STROKE_CLR  0x010101a5  // android:color (for <stroke>)
+#define SHAPE_ATTR_START_COLOR 0x0101019d  // android:startColor
+#define SHAPE_ATTR_END_COLOR   0x0101019e  // android:endColor
+#define SHAPE_ATTR_GRADIENT_TYPE 0x010101a0 // android:type (gradient)
+#define SELECTOR_ATTR_DRAWABLE 0x01010199  // android:drawable
+#define SELECTOR_ATTR_STATE_PRESSED  0x010100a7
+#define SELECTOR_ATTR_STATE_FOCUSED  0x0101009c
+#define SELECTOR_ATTR_STATE_ENABLED  0x0101009e
+#define SELECTOR_ATTR_STATE_SELECTED 0x010100a1
+#define SELECTOR_ATTR_STATE_CHECKED  0x010100a0
+
+// Parse a compiled shape drawable AXML.
+// Populates out_shape with the shape properties.
+// Returns true if successfully parsed as a shape drawable.
+static bool dx_ui_parse_shape_drawable(const uint8_t *data, uint32_t size,
+                                        DxShapeDrawable *out_shape) {
+    if (!data || size < 12 || !out_shape) return false;
+
+    uint32_t magic = read_u32(data);
+    if (magic != AXML_FILE_MAGIC) return false;
+
+    // Parse string pool (same as vector drawable parser)
+    uint32_t offset = 8;
+    if (offset + 8 > size) return false;
+
+    uint16_t sp_type = read_u16(data + offset);
+    if (sp_type != AXML_CHUNK_STRINGPOOL) return false;
+
+    uint32_t sp_size = read_u32(data + offset + 4);
+    uint32_t sp_string_count = read_u32(data + offset + 8);
+    if (sp_string_count > AXML_MAX_STRING_POOL || sp_string_count == 0) return false;
+
+    uint32_t sp_flags = read_u32(data + offset + 16);
+    bool is_utf8 = (sp_flags & (1u << 8)) != 0;
+    uint32_t strings_start = read_u32(data + offset + 20);
+    uint32_t sp_base = offset + 28;
+
+    uint32_t max_strings = sp_string_count < 4096 ? sp_string_count : 4096;
+    const char **string_pool = (const char **)dx_malloc(sizeof(char *) * max_strings);
+    char **string_pool_alloc = (char **)dx_malloc(sizeof(char *) * max_strings);
+    if (!string_pool || !string_pool_alloc) {
+        dx_free(string_pool); dx_free(string_pool_alloc);
+        return false;
+    }
+    memset(string_pool, 0, sizeof(char *) * max_strings);
+    memset(string_pool_alloc, 0, sizeof(char *) * max_strings);
+
+    for (uint32_t i = 0; i < max_strings; i++) {
+        if (sp_base + i * 4 + 4 > offset + sp_size) break;
+        uint32_t str_offset = read_u32(data + sp_base + i * 4);
+        uint32_t abs_offset_s = offset + strings_start + str_offset;
+        if (abs_offset_s + 2 > size) continue;
+
+        if (is_utf8) {
+            uint32_t p = abs_offset_s;
+            if (p >= size) continue;
+            if (data[p] & 0x80) p += 2; else p += 1;
+            if (p >= size) continue;
+            uint32_t byte_len;
+            if (data[p] & 0x80) {
+                if (p + 1 >= size) continue;
+                byte_len = ((data[p] & 0x7F) << 8) | data[p + 1];
+                p += 2;
+            } else {
+                byte_len = data[p]; p += 1;
+            }
+            if (p + byte_len > size) continue;
+            char *s = (char *)dx_malloc(byte_len + 1);
+            if (s) {
+                memcpy(s, data + p, byte_len);
+                s[byte_len] = '\0';
+                string_pool[i] = s; string_pool_alloc[i] = s;
+            }
+        } else {
+            uint32_t char_count = read_u16(data + abs_offset_s);
+            uint32_t p = abs_offset_s + 2;
+            if (p + char_count * 2 > size) continue;
+            char *s = (char *)dx_malloc(char_count + 1);
+            if (s) {
+                for (uint32_t c = 0; c < char_count; c++) {
+                    uint16_t ch = read_u16(data + p + c * 2);
+                    s[c] = (ch < 128) ? (char)ch : '?';
+                }
+                s[char_count] = '\0';
+                string_pool[i] = s; string_pool_alloc[i] = s;
+            }
+        }
+    }
+
+    // Parse resource ID map
+    uint32_t pos = offset + sp_size;
+    uint32_t *res_ids = NULL;
+    uint32_t res_id_count = 0;
+    if (pos + 8 <= size) {
+        uint16_t chunk_type = read_u16(data + pos);
+        if (chunk_type == AXML_CHUNK_RESOURCEMAP) {
+            uint32_t chunk_size = read_u32(data + pos + 4);
+            res_id_count = (chunk_size - 8) / 4;
+            if (res_id_count > 0 && pos + 8 + res_id_count * 4 <= size) {
+                res_ids = (uint32_t *)dx_malloc(sizeof(uint32_t) * res_id_count);
+                if (res_ids) {
+                    for (uint32_t i = 0; i < res_id_count; i++) {
+                        res_ids[i] = read_u32(data + pos + 8 + i * 4);
+                    }
+                }
+            }
+            pos += chunk_size;
+        }
+    }
+
+    // Initialize shape
+    memset(out_shape, 0, sizeof(DxShapeDrawable));
+    bool found_shape = false;
+
+    // Walk AXML chunks
+    while (pos + 8 <= size) {
+        uint16_t chunk_type = read_u16(data + pos);
+        uint32_t chunk_size = read_u32(data + pos + 4);
+        if (chunk_size < 8 || pos + chunk_size > size) break;
+
+        if (chunk_type == AXML_CHUNK_START_TAG && chunk_size >= 36) {
+            uint32_t name_idx = read_u32(data + pos + 20);
+            uint32_t attr_count = read_u16(data + pos + 28);
+            uint32_t attr_start = pos + 36;
+
+            const char *tag_name = NULL;
+            if (name_idx < max_strings) tag_name = string_pool[name_idx];
+
+            if (tag_name && strcmp(tag_name, "shape") == 0) {
+                found_shape = true;
+                out_shape->has_shape = true;
+                // Parse shape type attribute
+                for (uint32_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t attr_name_idx = read_u32(data + aoff + 4);
+                    uint32_t attr_data_v = read_u32(data + aoff + 16);
+                    uint32_t attr_res = 0;
+                    if (attr_name_idx < res_id_count && res_ids) attr_res = res_ids[attr_name_idx];
+                    const char *aname = (attr_name_idx < max_strings) ? string_pool[attr_name_idx] : NULL;
+                    if (attr_res == SHAPE_ATTR_SHAPE || (aname && strcmp(aname, "shape") == 0)) {
+                        out_shape->shape_type = (uint8_t)attr_data_v;
+                    }
+                }
+            }
+            else if (tag_name && strcmp(tag_name, "solid") == 0 && found_shape) {
+                for (uint32_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t attr_name_idx = read_u32(data + aoff + 4);
+                    uint8_t attr_type = data[aoff + 11];
+                    uint32_t attr_data_v = read_u32(data + aoff + 16);
+                    const char *aname = (attr_name_idx < max_strings) ? string_pool[attr_name_idx] : NULL;
+                    if (aname && strcmp(aname, "color") == 0) {
+                        if (attr_type == 0x1C || attr_type == 0x1D) {
+                            out_shape->solid_color = attr_data_v;
+                        }
+                    }
+                }
+            }
+            else if (tag_name && strcmp(tag_name, "corners") == 0 && found_shape) {
+                for (uint32_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t attr_name_idx = read_u32(data + aoff + 4);
+                    uint8_t attr_type = data[aoff + 11];
+                    uint32_t attr_data_v = read_u32(data + aoff + 16);
+                    const char *aname = (attr_name_idx < max_strings) ? string_pool[attr_name_idx] : NULL;
+                    if (aname && strcmp(aname, "radius") == 0) {
+                        if (attr_type == 0x05) {
+                            out_shape->corner_radius = dx_ui_decode_dimension(attr_data_v);
+                        } else if (attr_type == 0x04) {
+                            float f; memcpy(&f, &attr_data_v, sizeof(float));
+                            out_shape->corner_radius = f;
+                        } else {
+                            out_shape->corner_radius = (float)attr_data_v;
+                        }
+                    }
+                }
+            }
+            else if (tag_name && strcmp(tag_name, "stroke") == 0 && found_shape) {
+                for (uint32_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t attr_name_idx = read_u32(data + aoff + 4);
+                    uint8_t attr_type = data[aoff + 11];
+                    uint32_t attr_data_v = read_u32(data + aoff + 16);
+                    const char *aname = (attr_name_idx < max_strings) ? string_pool[attr_name_idx] : NULL;
+                    if (aname && strcmp(aname, "width") == 0) {
+                        if (attr_type == 0x05) {
+                            out_shape->stroke_width = dx_ui_decode_dimension(attr_data_v);
+                        } else if (attr_type == 0x04) {
+                            float f; memcpy(&f, &attr_data_v, sizeof(float));
+                            out_shape->stroke_width = f;
+                        } else {
+                            out_shape->stroke_width = (float)attr_data_v;
+                        }
+                    }
+                    else if (aname && strcmp(aname, "color") == 0) {
+                        if (attr_type == 0x1C || attr_type == 0x1D) {
+                            out_shape->stroke_color = attr_data_v;
+                        }
+                    }
+                }
+            }
+            else if (tag_name && strcmp(tag_name, "gradient") == 0 && found_shape) {
+                for (uint32_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t attr_name_idx = read_u32(data + aoff + 4);
+                    uint8_t attr_type = data[aoff + 11];
+                    uint32_t attr_data_v = read_u32(data + aoff + 16);
+                    uint32_t attr_res = 0;
+                    if (attr_name_idx < res_id_count && res_ids) attr_res = res_ids[attr_name_idx];
+                    const char *aname = (attr_name_idx < max_strings) ? string_pool[attr_name_idx] : NULL;
+                    if (aname && strcmp(aname, "startColor") == 0) {
+                        if (attr_type == 0x1C || attr_type == 0x1D) {
+                            out_shape->gradient_start = attr_data_v;
+                        }
+                    }
+                    else if (aname && strcmp(aname, "endColor") == 0) {
+                        if (attr_type == 0x1C || attr_type == 0x1D) {
+                            out_shape->gradient_end = attr_data_v;
+                        }
+                    }
+                    else if (aname && strcmp(aname, "type") == 0) {
+                        out_shape->gradient_type = (uint8_t)attr_data_v;
+                    }
+                }
+            }
+        }
+        pos += chunk_size;
+    }
+
+    // Cleanup
+    for (uint32_t i = 0; i < max_strings; i++) dx_free(string_pool_alloc[i]);
+    dx_free(string_pool);
+    dx_free(string_pool_alloc);
+    dx_free(res_ids);
+
+    if (found_shape) {
+        DX_INFO(TAG, "Parsed shape drawable: type=%d, solid=0x%08x, radius=%.1f, stroke=%.1f/0x%08x",
+                out_shape->shape_type, out_shape->solid_color, out_shape->corner_radius,
+                out_shape->stroke_width, out_shape->stroke_color);
+    }
+    return found_shape;
+}
+
+// Parse a compiled selector (StateListDrawable) AXML.
+// Returns the default drawable resource ID (the <item> without state attributes).
+// Returns 0 if no default item found.
+static uint32_t dx_ui_parse_selector_drawable(const uint8_t *data, uint32_t size) {
+    if (!data || size < 12) return 0;
+
+    uint32_t magic = read_u32(data);
+    if (magic != AXML_FILE_MAGIC) return 0;
+
+    uint32_t offset = 8;
+    if (offset + 8 > size) return 0;
+
+    uint16_t sp_type = read_u16(data + offset);
+    if (sp_type != AXML_CHUNK_STRINGPOOL) return 0;
+
+    uint32_t sp_size = read_u32(data + offset + 4);
+    uint32_t sp_string_count = read_u32(data + offset + 8);
+    if (sp_string_count > AXML_MAX_STRING_POOL || sp_string_count == 0) return 0;
+
+    uint32_t sp_flags = read_u32(data + offset + 16);
+    bool is_utf8 = (sp_flags & (1u << 8)) != 0;
+    uint32_t strings_start = read_u32(data + offset + 20);
+    uint32_t sp_base = offset + 28;
+
+    uint32_t max_strings = sp_string_count < 4096 ? sp_string_count : 4096;
+    const char **string_pool = (const char **)dx_malloc(sizeof(char *) * max_strings);
+    char **string_pool_alloc = (char **)dx_malloc(sizeof(char *) * max_strings);
+    if (!string_pool || !string_pool_alloc) {
+        dx_free(string_pool); dx_free(string_pool_alloc);
+        return 0;
+    }
+    memset(string_pool, 0, sizeof(char *) * max_strings);
+    memset(string_pool_alloc, 0, sizeof(char *) * max_strings);
+
+    for (uint32_t i = 0; i < max_strings; i++) {
+        if (sp_base + i * 4 + 4 > offset + sp_size) break;
+        uint32_t str_offset = read_u32(data + sp_base + i * 4);
+        uint32_t abs_offset_s = offset + strings_start + str_offset;
+        if (abs_offset_s + 2 > size) continue;
+
+        if (is_utf8) {
+            uint32_t p = abs_offset_s;
+            if (p >= size) continue;
+            if (data[p] & 0x80) p += 2; else p += 1;
+            if (p >= size) continue;
+            uint32_t byte_len;
+            if (data[p] & 0x80) {
+                if (p + 1 >= size) continue;
+                byte_len = ((data[p] & 0x7F) << 8) | data[p + 1];
+                p += 2;
+            } else {
+                byte_len = data[p]; p += 1;
+            }
+            if (p + byte_len > size) continue;
+            char *s = (char *)dx_malloc(byte_len + 1);
+            if (s) {
+                memcpy(s, data + p, byte_len);
+                s[byte_len] = '\0';
+                string_pool[i] = s; string_pool_alloc[i] = s;
+            }
+        } else {
+            uint32_t char_count = read_u16(data + abs_offset_s);
+            uint32_t p = abs_offset_s + 2;
+            if (p + char_count * 2 > size) continue;
+            char *s = (char *)dx_malloc(char_count + 1);
+            if (s) {
+                for (uint32_t c = 0; c < char_count; c++) {
+                    uint16_t ch = read_u16(data + p + c * 2);
+                    s[c] = (ch < 128) ? (char)ch : '?';
+                }
+                s[char_count] = '\0';
+                string_pool[i] = s; string_pool_alloc[i] = s;
+            }
+        }
+    }
+
+    // Parse resource ID map
+    uint32_t pos = offset + sp_size;
+    uint32_t *res_ids = NULL;
+    uint32_t res_id_count = 0;
+    if (pos + 8 <= size) {
+        uint16_t chunk_type = read_u16(data + pos);
+        if (chunk_type == AXML_CHUNK_RESOURCEMAP) {
+            uint32_t chunk_size = read_u32(data + pos + 4);
+            res_id_count = (chunk_size - 8) / 4;
+            if (res_id_count > 0 && pos + 8 + res_id_count * 4 <= size) {
+                res_ids = (uint32_t *)dx_malloc(sizeof(uint32_t) * res_id_count);
+                if (res_ids) {
+                    for (uint32_t i = 0; i < res_id_count; i++) {
+                        res_ids[i] = read_u32(data + pos + 8 + i * 4);
+                    }
+                }
+            }
+            pos += chunk_size;
+        }
+    }
+
+    bool found_selector = false;
+    uint32_t default_drawable_id = 0;
+    uint32_t last_drawable_id = 0;  // fallback: use last item's drawable
+
+    while (pos + 8 <= size) {
+        uint16_t chunk_type = read_u16(data + pos);
+        uint32_t chunk_size = read_u32(data + pos + 4);
+        if (chunk_size < 8 || pos + chunk_size > size) break;
+
+        if (chunk_type == AXML_CHUNK_START_TAG && chunk_size >= 36) {
+            uint32_t name_idx = read_u32(data + pos + 20);
+            uint32_t attr_count = read_u16(data + pos + 28);
+            uint32_t attr_start = pos + 36;
+
+            const char *tag_name = NULL;
+            if (name_idx < max_strings) tag_name = string_pool[name_idx];
+
+            if (tag_name && strcmp(tag_name, "selector") == 0) {
+                found_selector = true;
+            }
+            else if (tag_name && strcmp(tag_name, "item") == 0 && found_selector) {
+                // Check if this item has state attributes
+                bool has_state = false;
+                uint32_t drawable_id = 0;
+
+                for (uint32_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t attr_name_idx = read_u32(data + aoff + 4);
+                    uint8_t attr_type = data[aoff + 11];
+                    uint32_t attr_data_v = read_u32(data + aoff + 16);
+                    uint32_t attr_res = 0;
+                    if (attr_name_idx < res_id_count && res_ids) attr_res = res_ids[attr_name_idx];
+                    const char *aname = (attr_name_idx < max_strings) ? string_pool[attr_name_idx] : NULL;
+
+                    // Check for state attributes
+                    if (attr_res == SELECTOR_ATTR_STATE_PRESSED ||
+                        attr_res == SELECTOR_ATTR_STATE_FOCUSED ||
+                        attr_res == SELECTOR_ATTR_STATE_ENABLED ||
+                        attr_res == SELECTOR_ATTR_STATE_SELECTED ||
+                        attr_res == SELECTOR_ATTR_STATE_CHECKED ||
+                        (aname && strncmp(aname, "state_", 6) == 0)) {
+                        has_state = true;
+                    }
+
+                    // Extract drawable reference
+                    if (attr_res == SELECTOR_ATTR_DRAWABLE ||
+                        (aname && strcmp(aname, "drawable") == 0)) {
+                        if (attr_type == 0x01) {  // resource reference
+                            drawable_id = attr_data_v;
+                        }
+                    }
+
+                    // Also check android:color for color state lists
+                    if ((aname && strcmp(aname, "color") == 0)) {
+                        if (attr_type == 0x1C || attr_type == 0x1D) {
+                            // This is a color selector, not a drawable selector
+                            // Store color as pseudo-resource
+                        }
+                    }
+                }
+
+                if (drawable_id != 0) {
+                    last_drawable_id = drawable_id;
+                    if (!has_state) {
+                        // This is the default item (no state conditions)
+                        default_drawable_id = drawable_id;
+                    }
+                }
+            }
+        }
+        pos += chunk_size;
+    }
+
+    // Cleanup
+    for (uint32_t i = 0; i < max_strings; i++) dx_free(string_pool_alloc[i]);
+    dx_free(string_pool);
+    dx_free(string_pool_alloc);
+    dx_free(res_ids);
+
+    // Use default item, or fall back to last item
+    uint32_t result = default_drawable_id ? default_drawable_id : last_drawable_id;
+    if (found_selector && result) {
+        DX_INFO(TAG, "Parsed selector drawable: default_res=0x%08x", result);
+    }
+    return found_selector ? result : 0;
+}
+
+// Parse a compiled layer-list AXML.
+// Returns the topmost (last) layer's drawable resource ID.
+static uint32_t dx_ui_parse_layer_list_drawable(const uint8_t *data, uint32_t size) {
+    if (!data || size < 12) return 0;
+
+    uint32_t magic = read_u32(data);
+    if (magic != AXML_FILE_MAGIC) return 0;
+
+    uint32_t offset = 8;
+    if (offset + 8 > size) return 0;
+
+    uint16_t sp_type = read_u16(data + offset);
+    if (sp_type != AXML_CHUNK_STRINGPOOL) return 0;
+
+    uint32_t sp_size = read_u32(data + offset + 4);
+    uint32_t sp_string_count = read_u32(data + offset + 8);
+    if (sp_string_count > AXML_MAX_STRING_POOL || sp_string_count == 0) return 0;
+
+    uint32_t sp_flags = read_u32(data + offset + 16);
+    bool is_utf8 = (sp_flags & (1u << 8)) != 0;
+    uint32_t strings_start = read_u32(data + offset + 20);
+    uint32_t sp_base = offset + 28;
+
+    uint32_t max_strings = sp_string_count < 4096 ? sp_string_count : 4096;
+    const char **string_pool = (const char **)dx_malloc(sizeof(char *) * max_strings);
+    char **string_pool_alloc = (char **)dx_malloc(sizeof(char *) * max_strings);
+    if (!string_pool || !string_pool_alloc) {
+        dx_free(string_pool); dx_free(string_pool_alloc);
+        return 0;
+    }
+    memset(string_pool, 0, sizeof(char *) * max_strings);
+    memset(string_pool_alloc, 0, sizeof(char *) * max_strings);
+
+    for (uint32_t i = 0; i < max_strings; i++) {
+        if (sp_base + i * 4 + 4 > offset + sp_size) break;
+        uint32_t str_offset = read_u32(data + sp_base + i * 4);
+        uint32_t abs_offset_s = offset + strings_start + str_offset;
+        if (abs_offset_s + 2 > size) continue;
+
+        if (is_utf8) {
+            uint32_t p = abs_offset_s;
+            if (p >= size) continue;
+            if (data[p] & 0x80) p += 2; else p += 1;
+            if (p >= size) continue;
+            uint32_t byte_len;
+            if (data[p] & 0x80) {
+                if (p + 1 >= size) continue;
+                byte_len = ((data[p] & 0x7F) << 8) | data[p + 1];
+                p += 2;
+            } else {
+                byte_len = data[p]; p += 1;
+            }
+            if (p + byte_len > size) continue;
+            char *s = (char *)dx_malloc(byte_len + 1);
+            if (s) {
+                memcpy(s, data + p, byte_len);
+                s[byte_len] = '\0';
+                string_pool[i] = s; string_pool_alloc[i] = s;
+            }
+        } else {
+            uint32_t char_count = read_u16(data + abs_offset_s);
+            uint32_t p = abs_offset_s + 2;
+            if (p + char_count * 2 > size) continue;
+            char *s = (char *)dx_malloc(char_count + 1);
+            if (s) {
+                for (uint32_t c = 0; c < char_count; c++) {
+                    uint16_t ch = read_u16(data + p + c * 2);
+                    s[c] = (ch < 128) ? (char)ch : '?';
+                }
+                s[char_count] = '\0';
+                string_pool[i] = s; string_pool_alloc[i] = s;
+            }
+        }
+    }
+
+    // Parse resource ID map
+    uint32_t pos = offset + sp_size;
+    uint32_t *res_ids = NULL;
+    uint32_t res_id_count = 0;
+    if (pos + 8 <= size) {
+        uint16_t chunk_type = read_u16(data + pos);
+        if (chunk_type == AXML_CHUNK_RESOURCEMAP) {
+            uint32_t chunk_size = read_u32(data + pos + 4);
+            res_id_count = (chunk_size - 8) / 4;
+            if (res_id_count > 0 && pos + 8 + res_id_count * 4 <= size) {
+                res_ids = (uint32_t *)dx_malloc(sizeof(uint32_t) * res_id_count);
+                if (res_ids) {
+                    for (uint32_t i = 0; i < res_id_count; i++) {
+                        res_ids[i] = read_u32(data + pos + 8 + i * 4);
+                    }
+                }
+            }
+            pos += chunk_size;
+        }
+    }
+
+    bool found_layer_list = false;
+    uint32_t last_drawable_id = 0;
+
+    while (pos + 8 <= size) {
+        uint16_t chunk_type = read_u16(data + pos);
+        uint32_t chunk_size = read_u32(data + pos + 4);
+        if (chunk_size < 8 || pos + chunk_size > size) break;
+
+        if (chunk_type == AXML_CHUNK_START_TAG && chunk_size >= 36) {
+            uint32_t name_idx = read_u32(data + pos + 20);
+            uint32_t attr_count = read_u16(data + pos + 28);
+            uint32_t attr_start = pos + 36;
+
+            const char *tag_name = NULL;
+            if (name_idx < max_strings) tag_name = string_pool[name_idx];
+
+            if (tag_name && strcmp(tag_name, "layer-list") == 0) {
+                found_layer_list = true;
+            }
+            else if (tag_name && strcmp(tag_name, "item") == 0 && found_layer_list) {
+                for (uint32_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t attr_name_idx = read_u32(data + aoff + 4);
+                    uint8_t attr_type = data[aoff + 11];
+                    uint32_t attr_data_v = read_u32(data + aoff + 16);
+                    const char *aname = (attr_name_idx < max_strings) ? string_pool[attr_name_idx] : NULL;
+
+                    if ((aname && strcmp(aname, "drawable") == 0) ||
+                        (attr_name_idx < res_id_count && res_ids && res_ids[attr_name_idx] == SELECTOR_ATTR_DRAWABLE)) {
+                        if (attr_type == 0x01) {
+                            last_drawable_id = attr_data_v;
+                        }
+                    }
+                }
+            }
+        }
+        pos += chunk_size;
+    }
+
+    // Cleanup
+    for (uint32_t i = 0; i < max_strings; i++) dx_free(string_pool_alloc[i]);
+    dx_free(string_pool);
+    dx_free(string_pool_alloc);
+    dx_free(res_ids);
+
+    if (found_layer_list && last_drawable_id) {
+        DX_INFO(TAG, "Parsed layer-list drawable: top_res=0x%08x", last_drawable_id);
+    }
+    return found_layer_list ? last_drawable_id : 0;
+}
+
+// Detect the root tag of an AXML binary XML file.
+// Returns: "vector", "shape", "selector", "layer-list", or NULL for unknown.
+static const char *dx_ui_detect_axml_root_tag(const uint8_t *data, uint32_t size) {
+    if (!data || size < 12) return NULL;
+
+    uint32_t magic = read_u32(data);
+    if (magic != AXML_FILE_MAGIC) return NULL;
+
+    uint32_t offset = 8;
+    if (offset + 8 > size) return NULL;
+
+    uint16_t sp_type = read_u16(data + offset);
+    if (sp_type != AXML_CHUNK_STRINGPOOL) return NULL;
+
+    uint32_t sp_size = read_u32(data + offset + 4);
+    uint32_t sp_string_count = read_u32(data + offset + 8);
+    if (sp_string_count > AXML_MAX_STRING_POOL || sp_string_count == 0) return NULL;
+
+    uint32_t sp_flags = read_u32(data + offset + 16);
+    bool is_utf8 = (sp_flags & (1u << 8)) != 0;
+    uint32_t strings_start = read_u32(data + offset + 20);
+    uint32_t sp_base = offset + 28;
+
+    // We only need to decode the first few strings to find the root tag
+    uint32_t max_strings = sp_string_count < 64 ? sp_string_count : 64;
+    char *temp_strings[64];
+    memset(temp_strings, 0, sizeof(temp_strings));
+
+    for (uint32_t i = 0; i < max_strings; i++) {
+        if (sp_base + i * 4 + 4 > offset + sp_size) break;
+        uint32_t str_offset = read_u32(data + sp_base + i * 4);
+        uint32_t abs_off = offset + strings_start + str_offset;
+        if (abs_off + 2 > size) continue;
+
+        if (is_utf8) {
+            uint32_t p = abs_off;
+            if (p >= size) continue;
+            if (data[p] & 0x80) p += 2; else p += 1;
+            if (p >= size) continue;
+            uint32_t byte_len;
+            if (data[p] & 0x80) {
+                if (p + 1 >= size) continue;
+                byte_len = ((data[p] & 0x7F) << 8) | data[p + 1]; p += 2;
+            } else {
+                byte_len = data[p]; p += 1;
+            }
+            if (p + byte_len > size) continue;
+            char *s = (char *)dx_malloc(byte_len + 1);
+            if (s) { memcpy(s, data + p, byte_len); s[byte_len] = '\0'; temp_strings[i] = s; }
+        } else {
+            uint32_t char_count = read_u16(data + abs_off);
+            uint32_t p = abs_off + 2;
+            if (p + char_count * 2 > size) continue;
+            char *s = (char *)dx_malloc(char_count + 1);
+            if (s) {
+                for (uint32_t c = 0; c < char_count; c++) {
+                    uint16_t ch = read_u16(data + p + c * 2);
+                    s[c] = (ch < 128) ? (char)ch : '?';
+                }
+                s[char_count] = '\0'; temp_strings[i] = s;
+            }
+        }
+    }
+
+    // Skip past string pool and resource ID map to find first START_TAG
+    uint32_t pos = offset + sp_size;
+    if (pos + 8 <= size && read_u16(data + pos) == AXML_CHUNK_RESOURCEMAP) {
+        uint32_t chunk_size = read_u32(data + pos + 4);
+        pos += chunk_size;
+    }
+
+    // Find the first START_TAG chunk to determine root element
+    const char *result = NULL;
+    while (pos + 8 <= size) {
+        uint16_t chunk_type = read_u16(data + pos);
+        uint32_t chunk_size = read_u32(data + pos + 4);
+        if (chunk_size < 8 || pos + chunk_size > size) break;
+
+        if (chunk_type == AXML_CHUNK_START_TAG && chunk_size >= 36) {
+            uint32_t name_idx = read_u32(data + pos + 20);
+            if (name_idx < max_strings && temp_strings[name_idx]) {
+                const char *tag = temp_strings[name_idx];
+                if (strcmp(tag, "vector") == 0 ||
+                    strcmp(tag, "shape") == 0 ||
+                    strcmp(tag, "selector") == 0 ||
+                    strcmp(tag, "layer-list") == 0) {
+                    result = tag;
+                }
+            }
+            break;  // only need first tag
+        }
+        pos += chunk_size;
+    }
+
+    // Copy result before freeing
+    static char root_tag_buf[32];
+    if (result) {
+        size_t len = strlen(result);
+        if (len >= sizeof(root_tag_buf)) len = sizeof(root_tag_buf) - 1;
+        memcpy(root_tag_buf, result, len);
+        root_tag_buf[len] = '\0';
+    }
+
+    for (uint32_t i = 0; i < max_strings; i++) dx_free(temp_strings[i]);
+
+    return result ? root_tag_buf : NULL;
+}
+
+// ============================================================
+// 9-patch PNG support
+// ============================================================
+
+// Check if PNG data contains an npTc chunk (compiled 9-patch).
+// PNG chunks are: 4-byte length (big-endian), 4-byte type, data, 4-byte CRC.
+static bool dx_is_nine_patch_png(const uint8_t *data, size_t size) {
+    if (!data || size < 16) return false;
+    // Skip PNG signature (8 bytes)
+    for (size_t i = 8; i + 8 < size; ) {
+        uint32_t chunk_len = ((uint32_t)data[i] << 24) | ((uint32_t)data[i+1] << 16) |
+                             ((uint32_t)data[i+2] << 8) | (uint32_t)data[i+3];
+        if (memcmp(data + i + 4, "npTc", 4) == 0) return true;
+        // Advance past length(4) + type(4) + data(chunk_len) + crc(4)
+        size_t next = i + 12 + chunk_len;
+        if (next <= i) break;  // overflow guard
+        i = next;
+    }
+    return false;
+}
+
+// Parse the npTc chunk from compiled 9-patch PNG data.
+// Populates the node's nine_patch fields.  Returns true on success.
+//
+// npTc layout (Res_png_9patch, little-endian after deserialization):
+//   offset 0: was_deserialized (1 byte)
+//   offset 1: numXDivs (1 byte)
+//   offset 2: numYDivs (1 byte)
+//   offset 3: numColors (1 byte)
+//   offset 4-7: padding (unused alignment)
+//   offset 8-11: paddingLeft   (int32_t LE)
+//   offset 12-15: paddingRight  (int32_t LE)
+//   offset 16-19: paddingTop    (int32_t LE)
+//   offset 20-23: paddingBottom (int32_t LE)
+//   offset 24-27: padding (unused alignment)
+//   offset 28+: xDivs[numXDivs] as int32_t LE, then yDivs[numYDivs]
+//
+static bool dx_parse_nine_patch(const uint8_t *png_data, size_t png_size, DxUINode *node) {
+    if (!png_data || !node || png_size < 16) return false;
+
+    // Locate the npTc chunk
+    const uint8_t *chunk_data = NULL;
+    uint32_t chunk_len = 0;
+    for (size_t i = 8; i + 8 < png_size; ) {
+        uint32_t clen = ((uint32_t)png_data[i] << 24) | ((uint32_t)png_data[i+1] << 16) |
+                        ((uint32_t)png_data[i+2] << 8) | (uint32_t)png_data[i+3];
+        if (memcmp(png_data + i + 4, "npTc", 4) == 0) {
+            chunk_data = png_data + i + 8;
+            chunk_len = clen;
+            break;
+        }
+        size_t next = i + 12 + clen;
+        if (next <= i) break;
+        i = next;
+    }
+    if (!chunk_data || chunk_len < 32) return false;
+
+    uint8_t num_x_divs = chunk_data[1];
+    uint8_t num_y_divs = chunk_data[2];
+
+    // Read padding (little-endian int32s at offsets 8,12,16,20)
+    #define LE32(p, off) ((int32_t)((uint32_t)(p)[(off)] | ((uint32_t)(p)[(off)+1] << 8) | \
+                          ((uint32_t)(p)[(off)+2] << 16) | ((uint32_t)(p)[(off)+3] << 24)))
+
+    node->nine_patch_padding[0] = LE32(chunk_data, 8);   // left
+    node->nine_patch_padding[1] = LE32(chunk_data, 16);  // top
+    node->nine_patch_padding[2] = LE32(chunk_data, 12);  // right
+    node->nine_patch_padding[3] = LE32(chunk_data, 20);  // bottom
+
+    // xDivs start at offset 32 (after the 32-byte header)
+    size_t divs_offset = 32;
+    size_t needed = divs_offset + (num_x_divs + num_y_divs) * 4;
+    if (chunk_len < needed) return false;
+
+    // Read first pair of x divs (horizontal stretch region)
+    if (num_x_divs >= 2) {
+        node->nine_patch_stretch_x[0] = LE32(chunk_data, divs_offset);
+        node->nine_patch_stretch_x[1] = LE32(chunk_data, divs_offset + 4);
+    } else {
+        node->nine_patch_stretch_x[0] = 0;
+        node->nine_patch_stretch_x[1] = 0;
+    }
+
+    // Read first pair of y divs (vertical stretch region)
+    size_t y_offset = divs_offset + num_x_divs * 4;
+    if (num_y_divs >= 2) {
+        node->nine_patch_stretch_y[0] = LE32(chunk_data, y_offset);
+        node->nine_patch_stretch_y[1] = LE32(chunk_data, y_offset + 4);
+    } else {
+        node->nine_patch_stretch_y[0] = 0;
+        node->nine_patch_stretch_y[1] = 0;
+    }
+
+    #undef LE32
+
+    node->is_nine_patch = true;
+    DX_INFO(TAG, "9-patch: pad=[%d,%d,%d,%d] stretchX=[%d,%d] stretchY=[%d,%d]",
+            node->nine_patch_padding[0], node->nine_patch_padding[1],
+            node->nine_patch_padding[2], node->nine_patch_padding[3],
+            node->nine_patch_stretch_x[0], node->nine_patch_stretch_x[1],
+            node->nine_patch_stretch_y[0], node->nine_patch_stretch_y[1]);
+    return true;
+}
+
+// Try to extract a drawable resource from the APK for a given resource ID.
+// First attempts to extract as a vector drawable (AXML). If not, tries as raster image.
+// For vector drawables, populates the node's vector fields directly and returns NULL.
+// For raster images, returns allocated image bytes (caller owns).
+// The node parameter is used to store vector drawable data when found.
+static uint8_t *dx_ui_extract_drawable_ex(DxContext *ctx, uint32_t res_id, uint32_t *out_len,
+                                           DxUINode *node) {
+    if (!ctx || !ctx->resources || !ctx->apk || !out_len) return NULL;
+
     if (!ctx || !ctx->resources || !ctx->apk || !out_len) return NULL;
 
     // Look up the resource entry to get the drawable file path
     const DxResourceEntry *entry = dx_resources_find_by_id(ctx->resources, res_id);
     if (!entry) return NULL;
 
-    // The entry should be a string type pointing to a file path like "res/drawable-hdpi/icon.png"
     const char *path = NULL;
     if (entry->value_type == DX_RES_TYPE_STRING && entry->str_val) {
         path = entry->str_val;
     }
     if (!path) return NULL;
 
-    // Only extract actual image files (PNG, JPEG, WEBP)
+    // Check file extension
     size_t plen = strlen(path);
     bool is_image = false;
+    bool is_xml = false;
     if (plen > 4) {
         const char *ext = path + plen - 4;
         if (strcmp(ext, ".png") == 0 || strcmp(ext, ".jpg") == 0 ||
             strcmp(ext, ".PNG") == 0 || strcmp(ext, ".JPG") == 0) {
             is_image = true;
+        }
+        if (strcmp(ext, ".xml") == 0 || strcmp(ext, ".XML") == 0) {
+            is_xml = true;
         }
         if (plen > 5) {
             ext = path + plen - 5;
@@ -542,25 +1658,105 @@ static uint8_t *dx_ui_extract_drawable(DxContext *ctx, uint32_t res_id, uint32_t
             }
         }
     }
-    if (!is_image) return NULL;
 
     // Find and extract the entry from the APK
     const DxZipEntry *zip_entry = NULL;
     if (dx_apk_find_entry(ctx->apk, path, &zip_entry) != DX_OK) {
-        // Try density-qualified variants: drawable-hdpi, drawable-xhdpi, drawable-xxhdpi, etc.
-        // The resource might point to a specific density but the APK may have others
         return NULL;
     }
 
     uint8_t *data = NULL;
-    uint32_t size = 0;
-    if (dx_apk_extract_entry(ctx->apk, zip_entry, &data, &size) != DX_OK) {
+    uint32_t data_size = 0;
+    if (dx_apk_extract_entry(ctx->apk, zip_entry, &data, &data_size) != DX_OK) {
         return NULL;
     }
 
-    DX_INFO(TAG, "Extracted drawable: %s (%u bytes) for res 0x%08x", path, size, res_id);
-    *out_len = size;
+    // Check if the extracted data starts with AXML magic (compiled XML)
+    // This handles the case where .xml extension drawable files are compiled binary XML
+    if (data_size >= 8 && read_u32(data) == AXML_FILE_MAGIC) {
+        // Detect root tag to dispatch to correct parser
+        const char *root_tag = dx_ui_detect_axml_root_tag(data, data_size);
+
+        if (root_tag && strcmp(root_tag, "vector") == 0) {
+            // Vector drawable
+            char *pd = NULL;
+            uint32_t fc = 0, sc = 0;
+            float sw = 0, vw = 0, vh = 0;
+            if (node && dx_ui_parse_vector_drawable(data, data_size, &pd, &fc, &sc, &sw, &vw, &vh)) {
+                dx_free(node->vector_path_data);
+                node->vector_path_data = pd;
+                node->vector_fill_color = fc;
+                node->vector_stroke_color = sc;
+                node->vector_stroke_width = sw;
+                node->vector_width = vw;
+                node->vector_height = vh;
+                dx_free(data);
+                return NULL;
+            }
+        }
+        else if (root_tag && strcmp(root_tag, "shape") == 0) {
+            // Shape drawable - parse and store on node
+            if (node) {
+                DxShapeDrawable shape;
+                if (dx_ui_parse_shape_drawable(data, data_size, &shape)) {
+                    node->shape_bg = shape;
+                }
+            }
+            dx_free(data);
+            return NULL;
+        }
+        else if (root_tag && strcmp(root_tag, "selector") == 0) {
+            // Selector (StateListDrawable) - extract default drawable
+            uint32_t default_res = dx_ui_parse_selector_drawable(data, data_size);
+            dx_free(data);
+            if (default_res != 0 && node && ctx) {
+                // Recursively extract the default drawable
+                return dx_ui_extract_drawable_ex(ctx, default_res, out_len, node);
+            }
+            return NULL;
+        }
+        else if (root_tag && strcmp(root_tag, "layer-list") == 0) {
+            // Layer-list drawable - use topmost layer
+            uint32_t top_res = dx_ui_parse_layer_list_drawable(data, data_size);
+            dx_free(data);
+            if (top_res != 0 && node && ctx) {
+                // Recursively extract the top layer's drawable
+                return dx_ui_extract_drawable_ex(ctx, top_res, out_len, node);
+            }
+            return NULL;
+        }
+
+        // Unknown XML drawable type
+        if (!is_image) {
+            dx_free(data);
+            return NULL;
+        }
+    }
+
+    if (!is_image && !is_xml) {
+        dx_free(data);
+        return NULL;
+    }
+
+    if (is_xml && !is_image) {
+        // Non-AXML XML file we can't handle
+        dx_free(data);
+        return NULL;
+    }
+
+    // Check for compiled 9-patch PNG (npTc chunk) and parse metadata
+    if (node && data_size > 16 && dx_is_nine_patch_png(data, data_size)) {
+        dx_parse_nine_patch(data, data_size, node);
+    }
+
+    DX_INFO(TAG, "Extracted drawable: %s (%u bytes) for res 0x%08x", path, data_size, res_id);
+    *out_len = data_size;
     return data;
+}
+
+// Legacy wrapper for backward compatibility
+static uint8_t *dx_ui_extract_drawable(DxContext *ctx, uint32_t res_id, uint32_t *out_len) {
+    return dx_ui_extract_drawable_ex(ctx, res_id, out_len, NULL);
 }
 
 // ============================================================
@@ -950,10 +2146,22 @@ DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_s
                         if (val > 0 && val < 200) node->text_size = val;
                     }
                 }
-                // android:background (color)
+                // android:background (color or drawable reference)
                 else if (attr_res_id == ATTR_BACKGROUND || strcmp(attr_name, "background") == 0) {
                     if (attr_type == 0x1C || attr_type == 0x1D) {
                         node->bg_color = attr_data;
+                    }
+                    else if (attr_type == 0x01 && ctx) {
+                        // Resource reference - could be a shape, selector, layer-list, or image drawable
+                        uint32_t bg_img_len = 0;
+                        uint8_t *bg_img = dx_ui_extract_drawable_ex(ctx, attr_data, &bg_img_len, node);
+                        if (bg_img && bg_img_len > 0) {
+                            // Raster image background - store as image data
+                            dx_free(node->image_data);
+                            node->image_data = bg_img;
+                            node->image_data_len = bg_img_len;
+                        }
+                        // Shape/selector/layer-list data stored on node by extract_drawable_ex
                     }
                 }
                 // android:padding (all sides)
@@ -994,6 +2202,25 @@ DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_s
                 // android:checked
                 else if (attr_res_id == ATTR_CHECKED || strcmp(attr_name, "checked") == 0) {
                     node->is_checked = (attr_data != 0);
+                }
+                // android:inputType (for EditText)
+                else if (attr_res_id == ATTR_INPUT_TYPE || strcmp(attr_name, "inputType") == 0) {
+                    node->input_type = attr_data;
+                }
+                // android:scaleType (for ImageView)
+                else if (attr_res_id == ATTR_SCALE_TYPE || strcmp(attr_name, "scaleType") == 0) {
+                    // Android enum: 0=matrix, 1=fitXY, 2=fitStart, 3=fitCenter, 4=fitEnd, 5=center, 6=centerCrop, 7=centerInside
+                    // Map to our enum: 0=fitCenter(default), 1=center, 2=centerCrop, 3=centerInside, 4=fitXY, 5=fitStart, 6=fitEnd
+                    switch (attr_data) {
+                        case 1: node->scale_type = 4; break;  // fitXY
+                        case 2: node->scale_type = 5; break;  // fitStart
+                        case 3: node->scale_type = 0; break;  // fitCenter (default)
+                        case 4: node->scale_type = 6; break;  // fitEnd
+                        case 5: node->scale_type = 1; break;  // center
+                        case 6: node->scale_type = 2; break;  // centerCrop
+                        case 7: node->scale_type = 3; break;  // centerInside
+                        default: node->scale_type = 0; break; // fitCenter fallback
+                    }
                 }
                 // android:layout_width
                 else if (attr_res_id == ATTR_LAYOUT_WIDTH || strcmp(attr_name, "layout_width") == 0) {
@@ -1060,13 +2287,15 @@ DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_s
                 else if (attr_res_id == ATTR_SRC || strcmp(attr_name, "src") == 0 ||
                          strcmp(attr_name, "srcCompat") == 0) {
                     if (attr_type == 0x01 && ctx) {
-                        // Resource reference - extract drawable image from APK
+                        // Resource reference - extract drawable from APK
+                        // Uses _ex variant which also detects vector drawables
                         uint32_t img_len = 0;
-                        uint8_t *img_data = dx_ui_extract_drawable(ctx, attr_data, &img_len);
+                        uint8_t *img_data = dx_ui_extract_drawable_ex(ctx, attr_data, &img_len, node);
                         if (img_data && img_len > 0) {
                             node->image_data = img_data;
                             node->image_data_len = img_len;
                         }
+                        // If img_data is NULL, vector data may have been set on node directly
                     }
                 }
                 // RelativeLayout: parent alignment flags (boolean attrs: 0x12 = true/-1)

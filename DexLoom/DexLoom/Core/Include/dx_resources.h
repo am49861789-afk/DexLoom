@@ -35,10 +35,22 @@ typedef struct {
     uint16_t screen_width;    // screen width in dp (0 = any)
     uint16_t screen_height;   // screen height in dp (0 = any)
     uint8_t  orientation;     // 0=any, 1=port, 2=land
-    uint8_t  screen_layout;   // screen size + long flags
-    uint8_t  ui_mode;         // night mode + type
+    uint8_t  screen_layout;   // raw screen size + long flags byte
+    uint8_t  ui_mode;         // raw night mode + type byte
+    uint8_t  night_mode;      // parsed: 0=unset, 1=notnight, 2=night
+    uint8_t  screen_size;     // parsed: 0=unset, 1=small, 2=normal, 3=large, 4=xlarge
     uint16_t smallest_screen_width_dp; // sw<N>dp qualifier
 } DxResConfig;
+
+// Night mode constants
+#define DX_NIGHT_MODE_NOTNIGHT  1
+#define DX_NIGHT_MODE_NIGHT     2
+
+// Screen size constants
+#define DX_SCREEN_SIZE_SMALL    1
+#define DX_SCREEN_SIZE_NORMAL   2
+#define DX_SCREEN_SIZE_LARGE    3
+#define DX_SCREEN_SIZE_XLARGE   4
 
 // Device configuration for qualifier matching
 typedef struct {
@@ -49,6 +61,8 @@ typedef struct {
     uint16_t screen_width;    // screen width in dp
     uint16_t screen_height;   // screen height in dp
     uint8_t  orientation;     // 1=portrait, 2=landscape
+    uint8_t  night_mode;      // 1=notnight (default), 2=night
+    uint8_t  screen_size;     // 1=small, 2=normal (default), 3=large, 4=xlarge
 } DxDeviceConfig;
 
 // Initialize a device config with iPhone defaults
@@ -102,6 +116,26 @@ typedef struct {
     DxResConfig config;      // qualifier config for this entry
 } DxResourceEntry;
 
+// Array resource (string-array or integer-array)
+typedef struct {
+    uint32_t res_id;
+    char **string_values;     // for string-array (NULL if integer-array)
+    int32_t *int_values;      // for integer-array (NULL if string-array)
+    uint32_t count;
+    bool is_string_array;     // true=string-array, false=integer-array
+} DxArrayResource;
+
+// Plural resource (quantity strings)
+typedef struct {
+    uint32_t res_id;
+    char *zero;
+    char *one;
+    char *two;
+    char *few;
+    char *many;
+    char *other;
+} DxPluralResource;
+
 // Parsed resources.arsc data
 typedef struct {
     // String pool from resources
@@ -132,6 +166,16 @@ typedef struct {
     DxStyleRecord *styles;
     uint32_t style_count;
     uint32_t style_capacity;
+
+    // Array resources (string-array, integer-array)
+    DxArrayResource *arrays;
+    uint32_t array_count;
+    uint32_t array_capacity;
+
+    // Plural resources
+    DxPluralResource *plurals;
+    uint32_t plural_count;
+    uint32_t plural_capacity;
 } DxResources;
 
 DxResult dx_resources_parse(const uint8_t *data, uint32_t size, DxResources **out);
@@ -170,6 +214,27 @@ char *dx_resources_format_dimen(float value, uint8_t unit);
 
 // Format a color value as "#AARRGGBB" string, caller must free
 char *dx_resources_format_color(uint32_t argb);
+
+// ============================================================
+// Array resource lookup
+// ============================================================
+
+// Returns array of strings for a string-array resource ID. out_count receives element count.
+const char **dx_resources_get_string_array(const DxResources *res, uint32_t res_id, uint32_t *out_count);
+
+// Returns array of ints for an integer-array resource ID. out_count receives element count.
+const int32_t *dx_resources_get_integer_array(const DxResources *res, uint32_t res_id, uint32_t *out_count);
+
+// Returns the array resource record for a given resource ID, or NULL.
+const DxArrayResource *dx_resources_find_array(const DxResources *res, uint32_t res_id);
+
+// ============================================================
+// Plural resource lookup
+// ============================================================
+
+// Returns the appropriate plural string for the given quantity.
+// Uses CLDR English rules: 1=one, else=other. Returns NULL if not found.
+const char *dx_resources_get_plural(const DxResources *res, uint32_t res_id, int quantity);
 
 // ============================================================
 // Style / Theme resolution

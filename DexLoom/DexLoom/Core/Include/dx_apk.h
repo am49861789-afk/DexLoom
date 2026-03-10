@@ -10,6 +10,7 @@ typedef struct {
     uint32_t  uncompressed_size;
     uint16_t  compression_method;
     uint32_t  data_offset;      // offset to compressed data in file
+    uint32_t  crc32;            // expected CRC-32 of uncompressed data
 } DxZipEntry;
 
 typedef struct {

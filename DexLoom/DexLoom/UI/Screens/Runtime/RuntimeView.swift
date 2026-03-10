@@ -104,7 +104,12 @@ struct AndroidViewRenderer: View {
     let bridge: RuntimeBridge
 
     var body: some View {
-        if (node.type == DX_VIEW_TEXT_VIEW || node.type == DX_VIEW_BUTTON ||
+        if !node.drawCommands.isEmpty {
+            // View with Canvas draw commands — render using SwiftUI Canvas
+            CanvasDrawView(commands: node.drawCommands, node: node)
+                .applyAndroidStyle(node: node)
+                .applyGestures(node: node, bridge: bridge)
+        } else if (node.type == DX_VIEW_TEXT_VIEW || node.type == DX_VIEW_BUTTON ||
            node.type == DX_VIEW_EDIT_TEXT || node.type == DX_VIEW_IMAGE_VIEW ||
            node.type == DX_VIEW_SWITCH || node.type == DX_VIEW_CHECKBOX ||
            node.type == DX_VIEW_RADIO_BUTTON || node.type == DX_VIEW_PROGRESS_BAR ||
@@ -375,11 +380,41 @@ struct AndroidViewRenderer: View {
 
     private var imageView: some View {
         Group {
-            if let data = node.imageData, let uiImage = UIImage(data: data) {
-                Image(uiImage: uiImage)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: .infinity, minHeight: 40)
+            if let pathData = node.vectorPathData, !pathData.isEmpty {
+                VectorDrawableView(
+                    pathData: pathData,
+                    fillColor: node.vectorFillColor,
+                    strokeColor: node.vectorStrokeColor,
+                    strokeWidth: node.vectorStrokeWidth,
+                    viewportWidth: node.vectorWidth,
+                    viewportHeight: node.vectorHeight
+                )
+                .frame(maxWidth: .infinity, minHeight: 40)
+            } else if let data = node.imageData, let uiImage = UIImage(data: data) {
+                if node.isNinePatch {
+                    // 9-patch PNG: use stretch regions as cap insets for resizable rendering
+                    let capInsets = UIEdgeInsets(
+                        top: CGFloat(node.ninePatchStretchY.0),
+                        left: CGFloat(node.ninePatchStretchX.0),
+                        bottom: max(CGFloat(uiImage.size.height) - CGFloat(node.ninePatchStretchY.1), 0),
+                        right: max(CGFloat(uiImage.size.width) - CGFloat(node.ninePatchStretchX.1), 0)
+                    )
+                    let resizable = uiImage.resizableImage(withCapInsets: capInsets, resizingMode: .stretch)
+                    Image(uiImage: resizable)
+                        .resizable()
+                        .frame(maxWidth: .infinity, minHeight: 40)
+                        .padding(EdgeInsets(
+                            top: CGFloat(node.ninePatchPadding.1),
+                            leading: CGFloat(node.ninePatchPadding.0),
+                            bottom: CGFloat(node.ninePatchPadding.3),
+                            trailing: CGFloat(node.ninePatchPadding.2)
+                        ))
+                } else {
+                    Image(uiImage: uiImage)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(maxWidth: .infinity, minHeight: 40)
+                }
             } else {
                 Image(systemName: "photo")
                     .font(.system(size: 40))
@@ -599,11 +634,94 @@ private struct AndroidStyleModifier: ViewModifier {
             .padding(.top, dp(node.padding.1))
             .padding(.trailing, dp(node.padding.2))
             .padding(.bottom, dp(node.padding.3))
-            .background(node.bgColor != 0 ? argbColor(node.bgColor) : Color.clear)
+            .background(shapeOrColorBackground)
             .padding(.leading, dp(node.margin.0))
             .padding(.top, dp(node.margin.1))
             .padding(.trailing, dp(node.margin.2))
             .padding(.bottom, dp(node.margin.3))
+    }
+
+    @ViewBuilder
+    private var shapeOrColorBackground: some View {
+        if let shape = node.shapeBg {
+            ShapeBackgroundView(shape: shape)
+        } else if node.bgColor != 0 {
+            argbColor(node.bgColor)
+        } else {
+            Color.clear
+        }
+    }
+}
+
+/// Renders a DxShapeDrawable as a SwiftUI shape background
+private struct ShapeBackgroundView: View {
+    let shape: ShapeBackground
+
+    var body: some View {
+        Group {
+            if hasGradient {
+                gradientShape
+            } else {
+                solidShape
+            }
+        }
+    }
+
+    private var hasGradient: Bool {
+        shape.gradientStart != 0 || shape.gradientEnd != 0
+    }
+
+    @ViewBuilder
+    private var solidShape: some View {
+        switch shape.shapeType {
+        case 1:  // oval
+            Ellipse()
+                .fill(fillColor)
+                .overlay(strokeOverlayOval)
+        default:  // rectangle (0) and others
+            RoundedRectangle(cornerRadius: CGFloat(shape.cornerRadius))
+                .fill(fillColor)
+                .overlay(strokeOverlayRect)
+        }
+    }
+
+    @ViewBuilder
+    private var gradientShape: some View {
+        let gradient = LinearGradient(
+            colors: [argbColor(shape.gradientStart), argbColor(shape.gradientEnd)],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+        switch shape.shapeType {
+        case 1:  // oval
+            Ellipse()
+                .fill(gradient)
+                .overlay(strokeOverlayOval)
+        default:  // rectangle
+            RoundedRectangle(cornerRadius: CGFloat(shape.cornerRadius))
+                .fill(gradient)
+                .overlay(strokeOverlayRect)
+        }
+    }
+
+    @ViewBuilder
+    private var strokeOverlayRect: some View {
+        if shape.strokeWidth > 0 && shape.strokeColor != 0 {
+            RoundedRectangle(cornerRadius: CGFloat(shape.cornerRadius))
+                .stroke(argbColor(shape.strokeColor), lineWidth: CGFloat(shape.strokeWidth))
+        }
+    }
+
+    @ViewBuilder
+    private var strokeOverlayOval: some View {
+        if shape.strokeWidth > 0 && shape.strokeColor != 0 {
+            Ellipse()
+                .stroke(argbColor(shape.strokeColor), lineWidth: CGFloat(shape.strokeWidth))
+        }
+    }
+
+    private var fillColor: Color {
+        shape.solidColor != 0 ? argbColor(shape.solidColor) : Color.clear
     }
 }
 
@@ -1076,5 +1194,618 @@ private struct WebViewWrapper: UIViewRepresentable {
             """
             webView.loadHTMLString(placeholder, baseURL: nil)
         }
+    }
+}
+
+// MARK: - Canvas draw command renderer
+
+/// Renders Android Canvas draw commands using SwiftUI's Canvas view
+private struct CanvasDrawView: View {
+    let commands: [DrawCommand]
+    let node: RenderNode
+
+    var body: some View {
+        Canvas { context, size in
+            for cmd in commands {
+                switch cmd.type {
+                case DX_DRAW_COLOR:
+                    // Fill entire canvas with color
+                    let rect = CGRect(origin: .zero, size: size)
+                    context.fill(Path(rect), with: .color(argbColor(cmd.color)))
+
+                case DX_DRAW_RECT:
+                    let rect = CGRect(
+                        x: CGFloat(cmd.params.0),
+                        y: CGFloat(cmd.params.1),
+                        width: CGFloat(cmd.params.2 - cmd.params.0),
+                        height: CGFloat(cmd.params.3 - cmd.params.1)
+                    )
+                    let path = Path(rect)
+                    drawPath(context: &context, path: path, cmd: cmd)
+
+                case DX_DRAW_CIRCLE:
+                    let cx = CGFloat(cmd.params.0)
+                    let cy = CGFloat(cmd.params.1)
+                    let r = CGFloat(cmd.params.2)
+                    let rect = CGRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2)
+                    let path = Path(ellipseIn: rect)
+                    drawPath(context: &context, path: path, cmd: cmd)
+
+                case DX_DRAW_LINE:
+                    var path = Path()
+                    path.move(to: CGPoint(x: CGFloat(cmd.params.0), y: CGFloat(cmd.params.1)))
+                    path.addLine(to: CGPoint(x: CGFloat(cmd.params.2), y: CGFloat(cmd.params.3)))
+                    let sw = max(CGFloat(cmd.strokeWidth), 1.0)
+                    context.stroke(path, with: .color(argbColor(cmd.color)),
+                                   lineWidth: sw)
+
+                case DX_DRAW_TEXT:
+                    if let text = cmd.text {
+                        let fontSize = max(CGFloat(cmd.textSize), 1.0)
+                        let resolved = context.resolve(
+                            Text(text)
+                                .font(.system(size: fontSize))
+                                .foregroundColor(argbColor(cmd.color))
+                        )
+                        let point = CGPoint(x: CGFloat(cmd.params.0),
+                                            y: CGFloat(cmd.params.1) - fontSize)
+                        context.draw(resolved, at: point, anchor: .topLeading)
+                    }
+
+                case DX_DRAW_ROUND_RECT:
+                    let rect = CGRect(
+                        x: CGFloat(cmd.params.0),
+                        y: CGFloat(cmd.params.1),
+                        width: CGFloat(cmd.params.2 - cmd.params.0),
+                        height: CGFloat(cmd.params.3 - cmd.params.1)
+                    )
+                    let rx = CGFloat(cmd.params.4)
+                    let ry = CGFloat(cmd.params.5)
+                    let cornerSize = CGSize(width: rx, height: ry)
+                    let path = Path(roundedRect: rect, cornerSize: cornerSize)
+                    drawPath(context: &context, path: path, cmd: cmd)
+
+                case DX_DRAW_OVAL:
+                    let rect = CGRect(
+                        x: CGFloat(cmd.params.0),
+                        y: CGFloat(cmd.params.1),
+                        width: CGFloat(cmd.params.2 - cmd.params.0),
+                        height: CGFloat(cmd.params.3 - cmd.params.1)
+                    )
+                    let path = Path(ellipseIn: rect)
+                    drawPath(context: &context, path: path, cmd: cmd)
+
+                case DX_DRAW_SAVE:
+                    break // SwiftUI Canvas does not support save/restore stack
+                case DX_DRAW_RESTORE:
+                    break
+                case DX_DRAW_TRANSLATE:
+                    break // Transform recording; would need state tracking
+                case DX_DRAW_ROTATE:
+                    break
+                case DX_DRAW_SCALE:
+                    break
+
+                default:
+                    break
+                }
+            }
+        }
+        .frame(
+            width: canvasWidth,
+            height: canvasHeight
+        )
+    }
+
+    /// Determine canvas dimensions from the node's explicit size or a default
+    private var canvasWidth: CGFloat? {
+        if node.width > 0 { return CGFloat(node.width) }
+        return nil  // let SwiftUI decide
+    }
+
+    private var canvasHeight: CGFloat? {
+        if node.height > 0 { return CGFloat(node.height) }
+        // Estimate from draw commands bounding box
+        var maxY: Float = 100
+        for cmd in commands {
+            switch cmd.type {
+            case DX_DRAW_RECT, DX_DRAW_ROUND_RECT, DX_DRAW_OVAL:
+                maxY = max(maxY, cmd.params.3) // bottom
+            case DX_DRAW_CIRCLE:
+                maxY = max(maxY, cmd.params.1 + cmd.params.2) // cy + r
+            case DX_DRAW_LINE:
+                maxY = max(maxY, max(cmd.params.1, cmd.params.3))
+            case DX_DRAW_TEXT:
+                maxY = max(maxY, cmd.params.1 + cmd.textSize)
+            default:
+                break
+            }
+        }
+        return CGFloat(maxY)
+    }
+
+    /// Draw a path with fill and/or stroke based on paint style
+    private func drawPath(context: inout GraphicsContext, path: Path, cmd: DrawCommand) {
+        let color = argbColor(cmd.color)
+        let sw = max(CGFloat(cmd.strokeWidth), 1.0)
+
+        switch cmd.paintStyle {
+        case 1: // STROKE
+            context.stroke(path, with: .color(color), lineWidth: sw)
+        case 2: // FILL_AND_STROKE
+            context.fill(path, with: .color(color))
+            context.stroke(path, with: .color(color), lineWidth: sw)
+        default: // 0 = FILL
+            context.fill(path, with: .color(color))
+        }
+    }
+}
+
+// MARK: - Vector drawable renderer
+
+/// Renders an Android VectorDrawable using SwiftUI Path from SVG path data
+private struct VectorDrawableView: View {
+    let pathData: String
+    let fillColor: UInt32
+    let strokeColor: UInt32
+    let strokeWidth: Float
+    let viewportWidth: Float
+    let viewportHeight: Float
+
+    var body: some View {
+        let vpW = CGFloat(max(viewportWidth, 1))
+        let vpH = CGFloat(max(viewportHeight, 1))
+        let parsed = SVGPathParser.parse(pathData)
+
+        Canvas { context, size in
+            // Scale from viewport to rendered size, preserving aspect ratio
+            let scaleX = size.width / vpW
+            let scaleY = size.height / vpH
+            let scale = min(scaleX, scaleY)
+            let offsetX = (size.width - vpW * scale) / 2
+            let offsetY = (size.height - vpH * scale) / 2
+
+            // Build a scaled path
+            var path = Path()
+            for cmd in parsed {
+                switch cmd {
+                case .moveTo(let x, let y):
+                    path.move(to: CGPoint(x: x * scale + offsetX, y: y * scale + offsetY))
+                case .lineTo(let x, let y):
+                    path.addLine(to: CGPoint(x: x * scale + offsetX, y: y * scale + offsetY))
+                case .cubicTo(let x1, let y1, let x2, let y2, let x, let y):
+                    path.addCurve(
+                        to: CGPoint(x: x * scale + offsetX, y: y * scale + offsetY),
+                        control1: CGPoint(x: x1 * scale + offsetX, y: y1 * scale + offsetY),
+                        control2: CGPoint(x: x2 * scale + offsetX, y: y2 * scale + offsetY)
+                    )
+                case .quadTo(let x1, let y1, let x, let y):
+                    path.addQuadCurve(
+                        to: CGPoint(x: x * scale + offsetX, y: y * scale + offsetY),
+                        control: CGPoint(x: x1 * scale + offsetX, y: y1 * scale + offsetY)
+                    )
+                case .arcTo(let rx, let ry, let rotation, let largeArc, let sweep, let x, let y):
+                    addArc(to: &path, rx: rx * scale, ry: ry * scale,
+                           rotation: rotation, largeArc: largeArc, sweep: sweep,
+                           endX: x * scale + offsetX, endY: y * scale + offsetY)
+                case .close:
+                    path.closeSubpath()
+                case .horizontalTo(let x):
+                    let cur = path.currentPoint ?? .zero
+                    path.addLine(to: CGPoint(x: x * scale + offsetX, y: cur.y))
+                case .verticalTo(let y):
+                    let cur = path.currentPoint ?? .zero
+                    path.addLine(to: CGPoint(x: cur.x, y: y * scale + offsetY))
+                }
+            }
+
+            // Fill
+            let fc = argbColor(fillColor)
+            context.fill(path, with: .color(fc))
+
+            // Stroke
+            if strokeColor != 0 && strokeWidth > 0 {
+                let sc = argbColor(strokeColor)
+                context.stroke(path, with: .color(sc), lineWidth: CGFloat(strokeWidth) * scale)
+            }
+        }
+        .aspectRatio(vpW / vpH, contentMode: .fit)
+    }
+
+    /// Approximate SVG arc with cubic bezier curves
+    private func addArc(to path: inout Path, rx: CGFloat, ry: CGFloat,
+                        rotation: CGFloat, largeArc: Bool, sweep: Bool,
+                        endX: CGFloat, endY: CGFloat) {
+        let cur = path.currentPoint ?? .zero
+        // Degenerate cases
+        if rx == 0 || ry == 0 {
+            path.addLine(to: CGPoint(x: endX, y: endY))
+            return
+        }
+        if cur.x == endX && cur.y == endY { return }
+
+        // Use endpoint parameterization -> center parameterization conversion
+        let phi = rotation * .pi / 180
+        let cosPhi = cos(phi)
+        let sinPhi = sin(phi)
+
+        let dx = (cur.x - endX) / 2
+        let dy = (cur.y - endY) / 2
+        let x1p = cosPhi * dx + sinPhi * dy
+        let y1p = -sinPhi * dx + cosPhi * dy
+
+        var rxAbs = abs(rx)
+        var ryAbs = abs(ry)
+
+        // Scale radii if necessary
+        let lambda = (x1p * x1p) / (rxAbs * rxAbs) + (y1p * y1p) / (ryAbs * ryAbs)
+        if lambda > 1 {
+            let sqrtLambda = sqrt(lambda)
+            rxAbs *= sqrtLambda
+            ryAbs *= sqrtLambda
+        }
+
+        let rxSq = rxAbs * rxAbs
+        let rySq = ryAbs * ryAbs
+        let x1pSq = x1p * x1p
+        let y1pSq = y1p * y1p
+
+        var sq = max(0, (rxSq * rySq - rxSq * y1pSq - rySq * x1pSq) / (rxSq * y1pSq + rySq * x1pSq))
+        sq = sqrt(sq) * (largeArc == sweep ? -1 : 1)
+
+        let cxp = sq * rxAbs * y1p / ryAbs
+        let cyp = -sq * ryAbs * x1p / rxAbs
+
+        let cx = cosPhi * cxp - sinPhi * cyp + (cur.x + endX) / 2
+        let cy = sinPhi * cxp + cosPhi * cyp + (cur.y + endY) / 2
+
+        let theta1 = angle(ux: 1, uy: 0, vx: (x1p - cxp) / rxAbs, vy: (y1p - cyp) / ryAbs)
+        var dTheta = angle(ux: (x1p - cxp) / rxAbs, uy: (y1p - cyp) / ryAbs,
+                           vx: (-x1p - cxp) / rxAbs, vy: (-y1p - cyp) / ryAbs)
+
+        if !sweep && dTheta > 0 { dTheta -= 2 * .pi }
+        if sweep && dTheta < 0 { dTheta += 2 * .pi }
+
+        // Approximate arc with cubic bezier segments (max 90 degrees each)
+        let segments = max(1, Int(ceil(abs(dTheta) / (.pi / 2))))
+        let segAngle = dTheta / CGFloat(segments)
+
+        for i in 0..<segments {
+            let t1 = theta1 + CGFloat(i) * segAngle
+            let t2 = t1 + segAngle
+            arcSegment(path: &path, cx: cx, cy: cy, rx: rxAbs, ry: ryAbs,
+                       phi: phi, t1: t1, t2: t2)
+        }
+    }
+
+    private func angle(ux: CGFloat, uy: CGFloat, vx: CGFloat, vy: CGFloat) -> CGFloat {
+        let dot = ux * vx + uy * vy
+        let len = sqrt(ux * ux + uy * uy) * sqrt(vx * vx + vy * vy)
+        var a = acos(max(-1, min(1, dot / max(len, 1e-10))))
+        if ux * vy - uy * vx < 0 { a = -a }
+        return a
+    }
+
+    private func arcSegment(path: inout Path, cx: CGFloat, cy: CGFloat,
+                            rx: CGFloat, ry: CGFloat, phi: CGFloat,
+                            t1: CGFloat, t2: CGFloat) {
+        let alpha = sin(t2 - t1) * (sqrt(4 + 3 * pow(tan((t2 - t1) / 2), 2)) - 1) / 3
+        let cosPhi = cos(phi)
+        let sinPhi = sin(phi)
+
+        func point(_ t: CGFloat) -> CGPoint {
+            let ct = cos(t), st = sin(t)
+            return CGPoint(
+                x: cx + cosPhi * rx * ct - sinPhi * ry * st,
+                y: cy + sinPhi * rx * ct + cosPhi * ry * st
+            )
+        }
+        func derivative(_ t: CGFloat) -> CGPoint {
+            let ct = cos(t), st = sin(t)
+            return CGPoint(
+                x: -cosPhi * rx * st - sinPhi * ry * ct,
+                y: -sinPhi * rx * st + cosPhi * ry * ct
+            )
+        }
+
+        let p1 = point(t1)
+        let p2 = point(t2)
+        let d1 = derivative(t1)
+        let d2 = derivative(t2)
+
+        let cp1 = CGPoint(x: p1.x + alpha * d1.x, y: p1.y + alpha * d1.y)
+        let cp2 = CGPoint(x: p2.x - alpha * d2.x, y: p2.y - alpha * d2.y)
+
+        path.addCurve(to: p2, control1: cp1, control2: cp2)
+    }
+}
+
+// MARK: - SVG path data parser
+
+/// Parsed SVG path command (all coordinates are absolute)
+private enum SVGPathCommand {
+    case moveTo(CGFloat, CGFloat)
+    case lineTo(CGFloat, CGFloat)
+    case horizontalTo(CGFloat)
+    case verticalTo(CGFloat)
+    case cubicTo(CGFloat, CGFloat, CGFloat, CGFloat, CGFloat, CGFloat)
+    case quadTo(CGFloat, CGFloat, CGFloat, CGFloat)
+    case arcTo(CGFloat, CGFloat, CGFloat, Bool, Bool, CGFloat, CGFloat)  // rx,ry,rot,large,sweep,x,y
+    case close
+}
+
+/// Parser for SVG path data strings (M, L, C, Q, Z, H, V, A, S, T and lowercase relative variants)
+private struct SVGPathParser {
+    static func parse(_ data: String) -> [SVGPathCommand] {
+        var commands: [SVGPathCommand] = []
+        var scanner = PathScanner(data)
+        var curX: CGFloat = 0
+        var curY: CGFloat = 0
+        var startX: CGFloat = 0
+        var startY: CGFloat = 0
+        var lastCp2X: CGFloat = 0  // for smooth curves
+        var lastCp2Y: CGFloat = 0
+        var lastCmd: Character = " "
+
+        while !scanner.isAtEnd {
+            scanner.skipWhitespaceAndCommas()
+            if scanner.isAtEnd { break }
+
+            var cmd = scanner.peekChar()
+            let isLetter = cmd.isLetter
+            if isLetter {
+                scanner.advance()
+            } else {
+                // Implicit repeat of last command
+                cmd = lastCmd
+            }
+
+            let isRelative = cmd.isLowercase
+            let cmdUpper = Character(String(cmd).uppercased())
+
+            switch cmdUpper {
+            case "M":
+                var first = true
+                while let x = scanner.nextNumber() {
+                    scanner.skipCommaOrWhitespace()
+                    guard let y = scanner.nextNumber() else { break }
+                    let ax = isRelative ? curX + x : x
+                    let ay = isRelative ? curY + y : y
+                    if first {
+                        commands.append(.moveTo(ax, ay))
+                        startX = ax; startY = ay
+                        first = false
+                    } else {
+                        commands.append(.lineTo(ax, ay))
+                    }
+                    curX = ax; curY = ay
+                    lastCp2X = curX; lastCp2Y = curY
+                }
+                lastCmd = isRelative ? "l" : "L"  // subsequent coords are lineTo
+
+            case "L":
+                while let x = scanner.nextNumber() {
+                    scanner.skipCommaOrWhitespace()
+                    guard let y = scanner.nextNumber() else { break }
+                    let ax = isRelative ? curX + x : x
+                    let ay = isRelative ? curY + y : y
+                    commands.append(.lineTo(ax, ay))
+                    curX = ax; curY = ay
+                    lastCp2X = curX; lastCp2Y = curY
+                }
+                lastCmd = cmd
+
+            case "H":
+                while let x = scanner.nextNumber() {
+                    let ax = isRelative ? curX + x : x
+                    commands.append(.horizontalTo(ax))
+                    curX = ax
+                    lastCp2X = curX; lastCp2Y = curY
+                }
+                lastCmd = cmd
+
+            case "V":
+                while let y = scanner.nextNumber() {
+                    let ay = isRelative ? curY + y : y
+                    commands.append(.verticalTo(ay))
+                    curY = ay
+                    lastCp2X = curX; lastCp2Y = curY
+                }
+                lastCmd = cmd
+
+            case "C":
+                while let x1 = scanner.nextNumber() {
+                    scanner.skipCommaOrWhitespace()
+                    guard let y1 = scanner.nextNumber() else { break }
+                    scanner.skipCommaOrWhitespace()
+                    guard let x2 = scanner.nextNumber() else { break }
+                    scanner.skipCommaOrWhitespace()
+                    guard let y2 = scanner.nextNumber() else { break }
+                    scanner.skipCommaOrWhitespace()
+                    guard let x = scanner.nextNumber() else { break }
+                    scanner.skipCommaOrWhitespace()
+                    guard let y = scanner.nextNumber() else { break }
+                    let ax1 = isRelative ? curX + x1 : x1
+                    let ay1 = isRelative ? curY + y1 : y1
+                    let ax2 = isRelative ? curX + x2 : x2
+                    let ay2 = isRelative ? curY + y2 : y2
+                    let ax = isRelative ? curX + x : x
+                    let ay = isRelative ? curY + y : y
+                    commands.append(.cubicTo(ax1, ay1, ax2, ay2, ax, ay))
+                    lastCp2X = ax2; lastCp2Y = ay2
+                    curX = ax; curY = ay
+                }
+                lastCmd = cmd
+
+            case "S":
+                // Smooth cubic: reflect last control point
+                while let x2 = scanner.nextNumber() {
+                    scanner.skipCommaOrWhitespace()
+                    guard let y2 = scanner.nextNumber() else { break }
+                    scanner.skipCommaOrWhitespace()
+                    guard let x = scanner.nextNumber() else { break }
+                    scanner.skipCommaOrWhitespace()
+                    guard let y = scanner.nextNumber() else { break }
+                    let ax1 = 2 * curX - lastCp2X
+                    let ay1 = 2 * curY - lastCp2Y
+                    let ax2 = isRelative ? curX + x2 : x2
+                    let ay2 = isRelative ? curY + y2 : y2
+                    let ax = isRelative ? curX + x : x
+                    let ay = isRelative ? curY + y : y
+                    commands.append(.cubicTo(ax1, ay1, ax2, ay2, ax, ay))
+                    lastCp2X = ax2; lastCp2Y = ay2
+                    curX = ax; curY = ay
+                }
+                lastCmd = cmd
+
+            case "Q":
+                while let x1 = scanner.nextNumber() {
+                    scanner.skipCommaOrWhitespace()
+                    guard let y1 = scanner.nextNumber() else { break }
+                    scanner.skipCommaOrWhitespace()
+                    guard let x = scanner.nextNumber() else { break }
+                    scanner.skipCommaOrWhitespace()
+                    guard let y = scanner.nextNumber() else { break }
+                    let ax1 = isRelative ? curX + x1 : x1
+                    let ay1 = isRelative ? curY + y1 : y1
+                    let ax = isRelative ? curX + x : x
+                    let ay = isRelative ? curY + y : y
+                    commands.append(.quadTo(ax1, ay1, ax, ay))
+                    lastCp2X = ax1; lastCp2Y = ay1
+                    curX = ax; curY = ay
+                }
+                lastCmd = cmd
+
+            case "T":
+                // Smooth quad: reflect last control point
+                while let x = scanner.nextNumber() {
+                    scanner.skipCommaOrWhitespace()
+                    guard let y = scanner.nextNumber() else { break }
+                    let ax1 = 2 * curX - lastCp2X
+                    let ay1 = 2 * curY - lastCp2Y
+                    let ax = isRelative ? curX + x : x
+                    let ay = isRelative ? curY + y : y
+                    commands.append(.quadTo(ax1, ay1, ax, ay))
+                    lastCp2X = ax1; lastCp2Y = ay1
+                    curX = ax; curY = ay
+                }
+                lastCmd = cmd
+
+            case "A":
+                while let rx = scanner.nextNumber() {
+                    scanner.skipCommaOrWhitespace()
+                    guard let ry = scanner.nextNumber() else { break }
+                    scanner.skipCommaOrWhitespace()
+                    guard let rotation = scanner.nextNumber() else { break }
+                    scanner.skipCommaOrWhitespace()
+                    guard let largeArcVal = scanner.nextNumber() else { break }
+                    scanner.skipCommaOrWhitespace()
+                    guard let sweepVal = scanner.nextNumber() else { break }
+                    scanner.skipCommaOrWhitespace()
+                    guard let x = scanner.nextNumber() else { break }
+                    scanner.skipCommaOrWhitespace()
+                    guard let y = scanner.nextNumber() else { break }
+                    let ax = isRelative ? curX + x : x
+                    let ay = isRelative ? curY + y : y
+                    commands.append(.arcTo(rx, ry, rotation, largeArcVal != 0, sweepVal != 0, ax, ay))
+                    curX = ax; curY = ay
+                    lastCp2X = curX; lastCp2Y = curY
+                }
+                lastCmd = cmd
+
+            case "Z":
+                commands.append(.close)
+                curX = startX; curY = startY
+                lastCp2X = curX; lastCp2Y = curY
+                lastCmd = cmd
+
+            default:
+                // Unknown command, skip
+                scanner.advance()
+            }
+        }
+
+        return commands
+    }
+}
+
+/// Simple character-based scanner for SVG path data
+private struct PathScanner {
+    private let chars: [Character]
+    private var index: Int
+
+    init(_ string: String) {
+        self.chars = Array(string)
+        self.index = 0
+    }
+
+    var isAtEnd: Bool { index >= chars.count }
+
+    func peekChar() -> Character {
+        guard index < chars.count else { return "\0" }
+        return chars[index]
+    }
+
+    mutating func advance() {
+        if index < chars.count { index += 1 }
+    }
+
+    mutating func skipWhitespaceAndCommas() {
+        while index < chars.count && (chars[index] == " " || chars[index] == "," ||
+                                       chars[index] == "\t" || chars[index] == "\n" ||
+                                       chars[index] == "\r") {
+            index += 1
+        }
+    }
+
+    mutating func skipCommaOrWhitespace() {
+        skipWhitespaceAndCommas()
+    }
+
+    /// Parse the next number (integer or decimal, possibly negative)
+    mutating func nextNumber() -> CGFloat? {
+        skipWhitespaceAndCommas()
+        guard index < chars.count else { return nil }
+
+        // Check if the next token looks like a number
+        let c = chars[index]
+        guard c == "-" || c == "+" || c == "." || c.isNumber else { return nil }
+
+        var numStr = ""
+        // Sign
+        if index < chars.count && (chars[index] == "-" || chars[index] == "+") {
+            numStr.append(chars[index])
+            index += 1
+        }
+        // Integer part
+        while index < chars.count && chars[index].isNumber {
+            numStr.append(chars[index])
+            index += 1
+        }
+        // Decimal part
+        if index < chars.count && chars[index] == "." {
+            numStr.append(".")
+            index += 1
+            while index < chars.count && chars[index].isNumber {
+                numStr.append(chars[index])
+                index += 1
+            }
+        }
+        // Exponent
+        if index < chars.count && (chars[index] == "e" || chars[index] == "E") {
+            numStr.append(chars[index])
+            index += 1
+            if index < chars.count && (chars[index] == "-" || chars[index] == "+") {
+                numStr.append(chars[index])
+                index += 1
+            }
+            while index < chars.count && chars[index].isNumber {
+                numStr.append(chars[index])
+                index += 1
+            }
+        }
+
+        guard !numStr.isEmpty, numStr != "-", numStr != "+", numStr != "." else { return nil }
+        return CGFloat(Double(numStr) ?? 0)
     }
 }

@@ -21,6 +21,19 @@
 #define DX_CONSTRAINT_NONE   0
 #define DX_CONSTRAINT_PARENT 0xFFFFFFFF
 
+// ShapeDrawable parsed from compiled shape XML
+typedef struct {
+    uint8_t shape_type;     // 0=rectangle, 1=oval, 2=line, 3=ring
+    uint32_t solid_color;   // ARGB
+    float corner_radius;    // dp
+    float stroke_width;     // dp
+    uint32_t stroke_color;  // ARGB
+    uint32_t gradient_start; // ARGB
+    uint32_t gradient_end;   // ARGB
+    uint8_t gradient_type;  // 0=linear, 1=radial, 2=sweep
+    bool has_shape;
+} DxShapeDrawable;
+
 // Canvas draw command types
 typedef enum {
     DX_DRAW_RECT = 0,
@@ -34,6 +47,8 @@ typedef enum {
     DX_DRAW_TRANSLATE,
     DX_DRAW_ROTATE,
     DX_DRAW_SCALE,
+    DX_DRAW_ARC,
+    DX_DRAW_OVAL,
 } DxDrawCmdType;
 
 // A single recorded Canvas draw command
@@ -85,6 +100,8 @@ struct DxUINode {
     uint32_t      bg_color;     // background color (ARGB, 0 = none)
     uint32_t      text_color;   // text color (ARGB, 0 = default)
     bool          is_checked;   // for CheckBox/Switch
+    uint32_t      input_type;   // android:inputType value (0x01=text, 0x81=password, 0x02=number, etc.)
+    uint8_t       scale_type;   // android:scaleType (0=fitCenter, 1=center, 2=centerCrop, 3=centerInside, 4=fitXY, 5=fitStart, 6=fitEnd)
 
     // RelativeLayout positioning flags (bit field)
     uint16_t      relative_flags;
@@ -100,6 +117,23 @@ struct DxUINode {
     // Image data (for ImageView - extracted from APK drawable resources)
     uint8_t     *image_data;       // PNG/JPEG bytes (owned, freed on destroy)
     uint32_t     image_data_len;   // length of image_data
+
+    // 9-patch PNG metadata (parsed from npTc chunk in compiled APK resources)
+    bool         is_nine_patch;
+    int32_t      nine_patch_padding[4];    // left, top, right, bottom content padding
+    int32_t      nine_patch_stretch_x[2];  // start, end of horizontal stretch region
+    int32_t      nine_patch_stretch_y[2];  // start, end of vertical stretch region
+
+    // Vector drawable data (for ImageView - parsed from AXML vector XML)
+    char        *vector_path_data;  // SVG path data string (owned)
+    uint32_t     vector_fill_color; // ARGB fill color
+    uint32_t     vector_stroke_color; // ARGB stroke color
+    float        vector_stroke_width; // stroke width in dp
+    float        vector_width;      // viewport width
+    float        vector_height;     // viewport height
+
+    // Shape drawable background (parsed from compiled shape/selector/layer-list XML)
+    DxShapeDrawable shape_bg;
 
     // WebView data
     char        *web_url;          // URL to load (owned, freed on destroy)
@@ -150,6 +184,8 @@ typedef struct DxRenderNode {
     uint32_t      bg_color;
     uint32_t      text_color;
     bool          is_checked;
+    uint32_t      input_type;   // android:inputType value
+    uint8_t       scale_type;   // android:scaleType enum
     bool          has_click_listener;
     bool          has_long_click_listener;
     bool          has_refresh_listener;
@@ -165,6 +201,23 @@ typedef struct DxRenderNode {
     // Image data (for ImageView)
     const uint8_t *image_data;     // PNG/JPEG bytes (NOT owned - points into DxUINode data)
     uint32_t       image_data_len;
+
+    // 9-patch PNG metadata
+    bool           is_nine_patch;
+    int32_t        nine_patch_padding[4];    // left, top, right, bottom content padding
+    int32_t        nine_patch_stretch_x[2];  // start, end of horizontal stretch region
+    int32_t        nine_patch_stretch_y[2];  // start, end of vertical stretch region
+
+    // Vector drawable data (for ImageView)
+    char          *vector_path_data;   // SVG path data string (owned copy)
+    uint32_t       vector_fill_color;  // ARGB fill color
+    uint32_t       vector_stroke_color; // ARGB stroke color
+    float          vector_stroke_width; // stroke width in dp
+    float          vector_width;       // viewport width
+    float          vector_height;      // viewport height
+
+    // Shape drawable background
+    DxShapeDrawable shape_bg;
 
     // WebView data
     char        *web_url;          // URL to load (owned copy)

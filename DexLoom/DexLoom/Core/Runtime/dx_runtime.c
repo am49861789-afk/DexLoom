@@ -1383,9 +1383,50 @@ DxRenderModel *dx_runtime_get_render_model(DxContext *ctx) {
     return ctx->render_model;
 }
 
+void dx_runtime_set_night_mode(DxContext *ctx, bool is_night) {
+    if (!ctx) return;
+    ctx->device_config.night_mode = is_night ? DX_NIGHT_MODE_NIGHT : DX_NIGHT_MODE_NOTNIGHT;
+    DX_INFO(TAG, "Night mode set to %s", is_night ? "night" : "notnight");
+}
+
 void dx_runtime_shutdown(DxContext *ctx) {
     if (!ctx) return;
     DX_INFO(TAG, "Runtime shutting down");
     ctx->running = false;
     dx_context_destroy(ctx);
+}
+
+// ============================================================
+// Network bridge — global callback for C -> Swift networking
+// ============================================================
+
+static DxNetworkCallback g_network_callback = NULL;
+
+void dx_runtime_set_network_callback(DxNetworkCallback callback) {
+    g_network_callback = callback;
+    DX_INFO(TAG, "Network callback %s", callback ? "registered" : "cleared");
+}
+
+bool dx_runtime_perform_network_request(const DxNetworkRequest *request, DxNetworkResponse *response) {
+    if (!g_network_callback || !request || !response) {
+        return false;
+    }
+    memset(response, 0, sizeof(*response));
+    *response = g_network_callback(request);
+    return true;
+}
+
+void dx_network_response_free(DxNetworkResponse *response) {
+    if (!response) return;
+    if (response->body) {
+        free(response->body);
+        response->body = NULL;
+    }
+    for (int i = 0; i < response->header_count; i++) {
+        if (response->header_names && response->header_names[i]) free(response->header_names[i]);
+        if (response->header_values && response->header_values[i]) free(response->header_values[i]);
+    }
+    if (response->header_names) { free(response->header_names); response->header_names = NULL; }
+    if (response->header_values) { free(response->header_values); response->header_values = NULL; }
+    response->header_count = 0;
 }

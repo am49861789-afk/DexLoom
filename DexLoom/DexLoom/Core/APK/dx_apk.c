@@ -15,6 +15,7 @@
 #define ZIP_METHOD_STORE        0
 #define ZIP_METHOD_DEFLATE      8
 #define ZIP_MAX_DECOMPRESSED_SIZE (500U * 1024U * 1024U)  // 500 MB
+#define ZIP_BOMB_RATIO          100  // max uncompressed/compressed ratio
 
 static uint16_t read_u16(const uint8_t *p) {
     return (uint16_t)(p[0] | (p[1] << 8));
@@ -80,6 +81,13 @@ DxResult dx_apk_open(const uint8_t *data, uint32_t size, DxApkFile **out) {
     apk->data = (uint8_t *)data;
     apk->data_size = size;
     apk->entry_count = entry_count;
+
+    // Integer overflow protection on allocation
+    if (entry_count > SIZE_MAX / sizeof(DxZipEntry)) {
+        DX_ERROR(TAG, "Entry count %u would overflow allocation", entry_count);
+        dx_free(apk);
+        return DX_ERR_INVALID_FORMAT;
+    }
     apk->entries = (DxZipEntry *)dx_malloc(sizeof(DxZipEntry) * entry_count);
     if (!apk->entries) {
         dx_free(apk);
@@ -126,6 +134,17 @@ DxResult dx_apk_open(const uint8_t *data, uint32_t size, DxApkFile **out) {
             return DX_ERR_ZIP_INVALID;
         }
 
+        // Reject absolute paths (starting with /)
+        if (name_len > 0 && name[0] == '/') {
+            DX_WARN(TAG, "Rejecting ZIP entry with absolute path: %s", name);
+            dx_free(name);
+            dx_apk_close(apk);
+            return DX_ERR_ZIP_INVALID;
+        }
+
+        // Read CRC32 from central directory (offset 16 in the entry)
+        uint32_t crc32_expected = read_u32(p + 16);
+
         // Calculate data offset from local file header
         uint32_t data_offset = local_offset;
         if (local_offset + 30 <= size) {
@@ -139,6 +158,7 @@ DxResult dx_apk_open(const uint8_t *data, uint32_t size, DxApkFile **out) {
         apk->entries[i].compressed_size = compressed;
         apk->entries[i].uncompressed_size = uncompressed;
         apk->entries[i].data_offset = data_offset;
+        apk->entries[i].crc32 = crc32_expected;
 
         DX_TRACE(TAG, "  [%u] %s (method=%u, size=%u/%u)",
                  i, name, method, compressed, uncompressed);
@@ -199,6 +219,16 @@ DxResult dx_apk_extract_entry(const DxApkFile *apk, const DxZipEntry *entry,
         return DX_ERR_ZIP_INVALID;
     }
 
+    // ZIP bomb detection: check compression ratio
+    if (entry->compression_method == ZIP_METHOD_DEFLATE &&
+        entry->compressed_size > 0 &&
+        entry->uncompressed_size / entry->compressed_size > ZIP_BOMB_RATIO) {
+        DX_WARN(TAG, "ZIP bomb detected for %s: ratio %u/%u = %u",
+                entry->filename, entry->uncompressed_size, entry->compressed_size,
+                entry->uncompressed_size / entry->compressed_size);
+        return DX_ERR_ZIP_INVALID;
+    }
+
     const uint8_t *compressed_data = apk->data + entry->data_offset;
 
     if (entry->compression_method == ZIP_METHOD_STORE) {
@@ -206,6 +236,16 @@ DxResult dx_apk_extract_entry(const DxApkFile *apk, const DxZipEntry *entry,
         uint8_t *buf = (uint8_t *)dx_malloc(entry->uncompressed_size);
         if (!buf) return DX_ERR_OUT_OF_MEMORY;
         memcpy(buf, compressed_data, entry->uncompressed_size);
+
+        // CRC32 validation
+        uint32_t actual_crc = (uint32_t)crc32(0L, buf, entry->uncompressed_size);
+        if (entry->crc32 != 0 && actual_crc != entry->crc32) {
+            DX_WARN(TAG, "CRC32 mismatch for %s: expected 0x%08x, got 0x%08x",
+                    entry->filename, entry->crc32, actual_crc);
+            dx_free(buf);
+            return DX_ERR_ZIP_INVALID;
+        }
+
         *out_data = buf;
         *out_size = entry->uncompressed_size;
         return DX_OK;
@@ -236,6 +276,15 @@ DxResult dx_apk_extract_entry(const DxApkFile *apk, const DxZipEntry *entry,
         if (ret != Z_STREAM_END) {
             dx_free(buf);
             DX_ERROR(TAG, "inflate failed for %s: %d", entry->filename, ret);
+            return DX_ERR_ZIP_INVALID;
+        }
+
+        // CRC32 validation
+        uint32_t actual_crc = (uint32_t)crc32(0L, buf, entry->uncompressed_size);
+        if (entry->crc32 != 0 && actual_crc != entry->crc32) {
+            DX_WARN(TAG, "CRC32 mismatch for %s: expected 0x%08x, got 0x%08x",
+                    entry->filename, entry->crc32, actual_crc);
+            dx_free(buf);
             return DX_ERR_ZIP_INVALID;
         }
 
