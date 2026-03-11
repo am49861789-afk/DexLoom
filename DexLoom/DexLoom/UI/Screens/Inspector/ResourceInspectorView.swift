@@ -8,9 +8,9 @@ struct ResourceInspectorView: View {
     @State private var isLoading = false
     @State private var hasSearched = false
     @State private var filterType = "All"
-
+    
     private let typeFilters = ["All", "string", "color", "dimen", "integer", "bool", "reference"]
-
+    
     var body: some View {
         NavigationStack {
             Group {
@@ -26,8 +26,8 @@ struct ResourceInspectorView: View {
                     loadEntries()
                 }
             }
-            .onChange(of: bridge.isLoaded) {
-                if bridge.isLoaded {
+            .onChange(of: bridge.isLoaded) { isLoaded in
+                if isLoaded {
                     loadEntries()
                 } else {
                     allEntries = []
@@ -37,7 +37,7 @@ struct ResourceInspectorView: View {
             }
         }
     }
-
+    
     private var emptyState: some View {
         VStack(spacing: 16) {
             Image(systemName: "tray.2.fill")
@@ -54,15 +54,15 @@ struct ResourceInspectorView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.dxBackground)
     }
-
+    
     private var resourceContent: some View {
         VStack(spacing: 0) {
             // Resource ID lookup
             lookupSection
-
+            
             Divider()
                 .background(Color.dxTextSecondary.opacity(0.3))
-
+            
             // Type filter
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
@@ -83,7 +83,7 @@ struct ResourceInspectorView: View {
                 .padding(.horizontal)
                 .padding(.vertical, 8)
             }
-
+            
             // Resource list
             if filteredEntries.isEmpty {
                 VStack(spacing: 12) {
@@ -110,20 +110,20 @@ struct ResourceInspectorView: View {
         }
         .background(Color.dxBackground)
     }
-
+    
     private var lookupSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             Label("Resource Lookup", systemImage: "magnifyingglass")
                 .font(.dxHeadline)
                 .foregroundStyle(Color.dxText)
-
+            
             HStack {
                 TextField("Resource ID (e.g., 0x7f0e0001)", text: $searchText)
                     .font(.dxCode)
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
-
+                
                 Button("Resolve") {
                     resolveResourceId()
                 }
@@ -132,7 +132,7 @@ struct ResourceInspectorView: View {
                 .tint(Color.dxPrimary)
                 .disabled(searchText.trimmingCharacters(in: .whitespaces).isEmpty)
             }
-
+            
             if hasSearched {
                 if let resolution = resolution {
                     resolutionDetail(resolution)
@@ -150,7 +150,7 @@ struct ResourceInspectorView: View {
         }
         .padding()
     }
-
+    
     private func resolutionDetail(_ res: ResourceResolution) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
@@ -159,16 +159,16 @@ struct ResourceInspectorView: View {
                     .foregroundStyle(Color.dxSecondary)
                 Spacer()
             }
-
+            
             VStack(alignment: .leading, spacing: 4) {
                 resolutionRow("ID", String(format: "0x%08X", res.resourceId))
                 resolutionRow("Type", res.type)
                 resolutionRow("Qualifiers", res.qualifiers)
                 resolutionRow("Config", res.configUsed)
-
+                
                 Divider()
                     .background(Color.dxTextSecondary.opacity(0.3))
-
+                
                 HStack(alignment: .top) {
                     Text("Value")
                         .font(.system(size: 11, weight: .medium, design: .monospaced))
@@ -185,7 +185,7 @@ struct ResourceInspectorView: View {
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
     }
-
+    
     private func resolutionRow(_ label: String, _ value: String) -> some View {
         HStack(alignment: .top) {
             Text(label)
@@ -198,7 +198,7 @@ struct ResourceInspectorView: View {
                 .textSelection(.enabled)
         }
     }
-
+    
     private var filteredEntries: [ResourceEntry] {
         let entries: [ResourceEntry]
         if filterType == "All" {
@@ -208,11 +208,11 @@ struct ResourceInspectorView: View {
         }
         return entries
     }
-
+    
     private func resolveResourceId() {
         let text = searchText.trimmingCharacters(in: .whitespaces)
         hasSearched = true
-
+        
         // Parse hex or decimal
         let resourceId: UInt32
         if text.lowercased().hasPrefix("0x") {
@@ -229,10 +229,10 @@ struct ResourceInspectorView: View {
             }
             resourceId = val
         }
-
+        
         resolution = bridge.resolveResource(id: resourceId)
     }
-
+    
     private func loadEntries() {
         isLoading = true
         allEntries = bridge.getAllResourceEntries()
@@ -241,10 +241,9 @@ struct ResourceInspectorView: View {
 }
 
 // MARK: - Resource Entry Row
-
 struct ResourceEntryRow: View {
     let entry: ResourceEntry
-
+    
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
@@ -252,9 +251,7 @@ struct ResourceEntryRow: View {
                     .font(.dxCode)
                     .foregroundStyle(Color.dxText)
                     .lineLimit(1)
-
                 Spacer()
-
                 Text(entry.type)
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .padding(.horizontal, 6)
@@ -263,16 +260,13 @@ struct ResourceEntryRow: View {
                     .foregroundStyle(typeColor(entry.type))
                     .clipShape(Capsule())
             }
-
             HStack {
                 Text(String(format: "0x%08X", entry.resourceId))
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(Color.dxTextSecondary)
-
                 Text("|")
                     .font(.system(size: 10))
                     .foregroundStyle(Color.dxTextSecondary.opacity(0.5))
-
                 Text(entry.value)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(Color.dxPrimary)
@@ -281,7 +275,7 @@ struct ResourceEntryRow: View {
         }
         .padding(.vertical, 4)
     }
-
+    
     private func typeColor(_ type: String) -> Color {
         switch type {
         case "string": return Color.dxSecondary
