@@ -10,11 +10,18 @@ on:
 jobs:
   build-unsigned-ipa:
     name: Build Unsigned IPA
-    runs-on: macos-14 # 推荐使用明确的 macOS 版本
+    # 关键修改：使用最新的 macOS 环境以确保自带 Xcode 16+
+    runs-on: macos-latest 
 
     steps:
       - name: 📥 检出代码 (Checkout Repository)
         uses: actions/checkout@v4
+
+      - name: 🛠️ 确保使用最新的 Xcode (Setup Xcode)
+        # 强制选择系统中已安装的最新版本 Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
 
       - name: 🏗️ 编译项目 (Build iOS App)
         run: |
@@ -32,6 +39,9 @@ jobs:
           
           # 进入项目所在目录
           cd "$PROJECT_DIR"
+          
+          echo "当前使用的 Xcode 版本信息："
+          xcodebuild -version
           
           echo "开始执行免签名编译..."
           xcodebuild clean build \
@@ -52,7 +62,7 @@ jobs:
           APP_PATH="$PROJECT_DIR/build/Build/Products/Release-iphoneos/DexLoom.app"
           
           if [ ! -d "$APP_PATH" ]; then
-            echo "错误: 找不到编译后的 .app 文件！"
+            echo "错误: 找不到编译后的 .app 文件！请检查上方 xcodebuild 日志。"
             exit 1
           fi
           
