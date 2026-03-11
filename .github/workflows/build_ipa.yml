@@ -1,1 +1,52 @@
+name: Build DexLoom IPA
 
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # 允许在 GitHub Actions 网页端手动触发构建
+
+jobs:
+  build-unsigned-ipa:
+    name: Build Unsigned IPA
+    runs-on: macos-latest # 必须使用 macOS 运行环境来提供 Xcode
+
+    steps:
+      - name: 📥 检出代码 (Checkout Repository)
+        uses: actions/checkout@v4
+
+      - name: 🏗️ 编译项目 (Build iOS App)
+        run: |
+          echo "开始执行免签名编译..."
+          # 强制禁用代码签名，直接编译出 Release 版本的 DexLoom.app
+          xcodebuild clean build \
+            -project DexLoom.xcodeproj \
+            -scheme DexLoom \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: 📦 打包为 IPA (Package to IPA)
+        run: |
+          echo "组装 IPA 文件结构..."
+          # IPA 文件的标准结构是外层有一个 Payload 目录
+          mkdir -p Payload
+          
+          # 将生成的 DexLoom.app 移动到 Payload 目录中
+          mv build/Build/Products/Release-iphoneos/DexLoom.app Payload/
+          
+          # 压缩为 DexLoom.ipa (静默压缩)
+          zip -qr DexLoom.ipa Payload
+          
+          echo "打包完成！"
+
+      - name: 📤 上传 IPA 制品 (Upload Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: DexLoom-Release-IPA
+          path: DexLoom.ipa
+          retention-days: 7 # 编译出来的产物在 GitHub 上保留 7 天
