@@ -1626,7 +1626,7 @@ private struct EditTextFieldView: View {
         )
         .focused($isFocused)
         .onAppear { text = initialText }
-        .onChange(of: text) { _, newValue in
+        .onChange(of: text) { newValue in
             bridge.updateEditText(viewId: viewId, text: newValue)
         }
     }
