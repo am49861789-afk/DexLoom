@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 enum AppTab: String, CaseIterable {
     case home = "Home"
