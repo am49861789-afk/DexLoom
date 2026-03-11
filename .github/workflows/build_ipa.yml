@@ -10,7 +10,6 @@ on:
 jobs:
   build-unsigned-ipa:
     name: Build Unsigned IPA
-    # 关键修改：使用最新的 macOS 环境以确保自带 Xcode 16+
     runs-on: macos-latest 
 
     steps:
@@ -18,15 +17,22 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 🛠️ 确保使用最新的 Xcode (Setup Xcode)
-        # 强制选择系统中已安装的最新版本 Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
 
+      - name: 🛠️ 降级最低 iOS 版本到 16.0
+        run: |
+          echo "自动修改 project.pbxproj 的部署目标为 iOS 16.0..."
+          PROJECT_PBXPROJ=$(find . -name "project.pbxproj" | head -n 1)
+          if [ -n "$PROJECT_PBXPROJ" ]; then
+            sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;/IPHONEOS_DEPLOYMENT_TARGET = 16.0;/g' "$PROJECT_PBXPROJ"
+            echo "版本号修改成功！"
+          fi
+
       - name: 🏗️ 编译项目 (Build iOS App)
         run: |
           echo "查找 Xcode 项目文件..."
-          # 自动搜索 DexLoom.xcodeproj 所在的相对路径
           PROJECT_PATH=$(find . -name "DexLoom.xcodeproj" | head -n 1)
           
           if [ -z "$PROJECT_PATH" ]; then
@@ -36,8 +42,6 @@ jobs:
           
           PROJECT_DIR=$(dirname "$PROJECT_PATH")
           echo "找到项目所在目录: $PROJECT_DIR"
-          
-          # 进入项目所在目录
           cd "$PROJECT_DIR"
           
           echo "当前使用的 Xcode 版本信息："
@@ -57,7 +61,6 @@ jobs:
       - name: 📦 打包为 IPA (Package to IPA)
         run: |
           echo "组装 IPA 文件结构..."
-          # 再次定位目录，找到编译出的产物
           PROJECT_DIR=$(dirname $(find . -name "DexLoom.xcodeproj" | head -n 1))
           APP_PATH="$PROJECT_DIR/build/Build/Products/Release-iphoneos/DexLoom.app"
           
@@ -66,7 +69,6 @@ jobs:
             exit 1
           fi
           
-          # 在当前(根)目录创建 Payload 文件夹并打包
           mkdir -p Payload
           mv "$APP_PATH" Payload/
           zip -qr DexLoom.ipa Payload
