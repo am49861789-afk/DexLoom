@@ -2,17 +2,22 @@
 #include "../Include/dx_log.h"
 #include "../Include/dx_view.h"
 #include "../Include/dx_context.h"
+#include "../Include/dx_runtime.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <mach/mach_time.h>
 
 #define TAG "VM"
 
 #include "../Include/dx_memory.h"
 
-// Forward declarations for framework registration
-extern DxResult dx_register_java_lang(DxVM *vm);
-extern DxResult dx_register_android_framework(DxVM *vm);
+// Nanoseconds using Mach absolute time (for profiling)
+static uint64_t dx_vm_time_ns(void) {
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    return mach_absolute_time() * tb.numer / tb.denom;
+}
 
 DxVM *dx_vm_create(DxContext *ctx) {
     DxVM *vm = (DxVM *)dx_malloc(sizeof(DxVM));
@@ -48,15 +53,24 @@ void dx_vm_destroy(DxVM *vm) {
             // Free method annotations and line tables before freeing methods
             for (uint32_t m = 0; m < vm->classes[i]->direct_method_count; m++) {
                 dx_free(vm->classes[i]->direct_methods[m].annotations);
+                dx_free(vm->classes[i]->direct_methods[m].ic_table);
                 dx_dex_free_code_item(&vm->classes[i]->direct_methods[m].code);
             }
             for (uint32_t m = 0; m < vm->classes[i]->virtual_method_count; m++) {
                 dx_free(vm->classes[i]->virtual_methods[m].annotations);
+                dx_free(vm->classes[i]->virtual_methods[m].ic_table);
                 dx_dex_free_code_item(&vm->classes[i]->virtual_methods[m].code);
             }
             dx_free(vm->classes[i]->direct_methods);
             dx_free(vm->classes[i]->virtual_methods);
             dx_free(vm->classes[i]->vtable);
+            // Free itable
+            if (vm->classes[i]->itable) {
+                for (int it = 0; it < vm->classes[i]->itable_count; it++) {
+                    dx_free(vm->classes[i]->itable[it].methods);
+                }
+                dx_free(vm->classes[i]->itable);
+            }
             dx_free(vm->classes[i]->interfaces);
             dx_free(vm->classes[i]->annotations);
             dx_free(vm->classes[i]);
@@ -2190,9 +2204,10 @@ static DxResult native_array_clone(DxVM *vm, DxFrame *frame, DxValue *args, uint
 }
 
 // --- Class.forName() -> actual class lookup ---
+// 1-arg: forName(String className) — defaults to initialize=true
+// 3-arg: forName(String className, boolean initialize, ClassLoader loader)
 
 static DxResult native_class_forname(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
-    (void)arg_count;
     // args[0] is the class name string (static method, no `this`)
     DxObject *name_obj = args[0].obj;
     if (!name_obj) {
@@ -2206,6 +2221,12 @@ static DxResult native_class_forname(DxVM *vm, DxFrame *frame, DxValue *args, ui
         frame->result = DX_NULL_VALUE;
         frame->has_result = true;
         return DX_OK;
+    }
+
+    // Determine initialize flag: 1-arg defaults to true, 3-arg reads args[1]
+    bool initialize = true;
+    if (arg_count >= 3) {
+        initialize = (args[1].tag == DX_VAL_INT) ? (args[1].i != 0) : true;
     }
 
     // Convert "com.example.Foo" to "Lcom/example/Foo;" descriptor format
@@ -2223,7 +2244,7 @@ static DxResult native_class_forname(DxVM *vm, DxFrame *frame, DxValue *args, ui
     desc[len + 1] = ';';
     desc[len + 2] = '\0';
 
-    DX_INFO(TAG, "Class.forName(\"%s\") -> %s", name, desc);
+    DX_INFO(TAG, "Class.forName(\"%s\", initialize=%d) -> %s", name, initialize, desc);
 
     DxClass *cls = dx_vm_find_class(vm, desc);
     if (!cls) {
@@ -2233,6 +2254,11 @@ static DxResult native_class_forname(DxVM *vm, DxFrame *frame, DxValue *args, ui
     dx_free(desc);
 
     if (cls) {
+        // Run <clinit> if initialize=true and class not yet initialized
+        if (initialize && cls->status < DX_CLASS_INITIALIZED) {
+            dx_vm_init_class(vm, cls);
+        }
+
         // Return an object representing the class
         DxClass *class_cls = dx_vm_find_class(vm, "Ljava/lang/Class;");
         DxObject *class_obj = dx_vm_alloc_object(vm, class_cls ? class_cls : cls);
@@ -3881,16 +3907,25 @@ DxResult dx_vm_load_class(DxVM *vm, const char *descriptor, DxClass **out) {
         return DX_ERR_CLASS_NOT_FOUND;
     }
 
-    // Search all DEX files for exact match
+    // Search all DEX files for exact match, detecting conflicts
     DxDexFile *found_dex = NULL;
     int32_t found_idx = -1;
-    for (uint32_t d = 0; d < vm->dex_count && found_idx < 0; d++) {
+    uint32_t found_dex_idx = 0;
+    for (uint32_t d = 0; d < vm->dex_count; d++) {
         DxDexFile *dex = vm->dex_files[d];
         for (uint32_t i = 0; i < dex->class_count; i++) {
             const char *type = dx_dex_get_type(dex, dex->class_defs[i].class_idx);
             if (type && strcmp(type, descriptor) == 0) {
-                found_dex = dex;
-                found_idx = (int32_t)i;
+                if (found_idx < 0) {
+                    // First occurrence wins
+                    found_dex = dex;
+                    found_idx = (int32_t)i;
+                    found_dex_idx = d;
+                } else {
+                    // Conflict: same class in multiple DEX files
+                    DX_WARN(TAG, "Class conflict: %s found in DEX %u and DEX %u",
+                            descriptor, found_dex_idx, d);
+                }
                 break;
             }
         }
@@ -3976,6 +4011,7 @@ DxResult dx_vm_load_class(DxVM *vm, const char *descriptor, DxClass **out) {
             cls->access_flags = found_dex->class_defs[i].access_flags;
             cls->dex_class_def_idx = i;
             cls->dex_file = found_dex;
+            cls->source_dex_idx = (uint8_t)found_dex_idx;
 
             // Parse interfaces from type_list at interfaces_off
             uint32_t iface_off = found_dex->class_defs[i].interfaces_off;
@@ -4008,12 +4044,17 @@ DxResult dx_vm_load_class(DxVM *vm, const char *descriptor, DxClass **out) {
             if (cd->instance_fields_count > 0) {
                 cls->field_defs = (typeof(cls->field_defs))dx_malloc(
                     sizeof(*cls->field_defs) * cd->instance_fields_count);
+                uint32_t super_field_count = super ? super->instance_field_count : 0;
                 for (uint32_t f = 0; f < cd->instance_fields_count; f++) {
                     uint32_t fidx = cd->instance_fields[f].field_idx;
                     cls->field_defs[f].name = dx_dex_get_field_name(vm->dex, fidx);
                     cls->field_defs[f].type = fidx < vm->dex->field_count ?
                         dx_dex_get_type(vm->dex, vm->dex->field_ids[fidx].type_idx) : "?";
                     cls->field_defs[f].flags = cd->instance_fields[f].access_flags;
+                    cls->field_defs[f].is_volatile =
+                        (cd->instance_fields[f].access_flags & DX_ACC_VOLATILE) != 0;
+                    // Precompute absolute slot index: super fields come first
+                    cls->field_defs[f].slot_index = super_field_count + f;
                 }
             }
 
@@ -4113,6 +4154,47 @@ DxResult dx_vm_load_class(DxVM *vm, const char *descriptor, DxClass **out) {
                     if (!overridden) {
                         method->vtable_idx = (int32_t)(super_vtable_size + m);
                         cls->vtable[super_vtable_size + m] = method;
+                    }
+                }
+            }
+
+            // Build itable: for each implemented interface, map interface methods to class methods
+            if (cls->interface_count > 0) {
+                cls->itable = (typeof(cls->itable))dx_malloc(sizeof(*cls->itable) * cls->interface_count);
+                if (cls->itable) {
+                    cls->itable_count = 0;
+                    for (uint32_t ii = 0; ii < cls->interface_count; ii++) {
+                        if (!cls->interfaces[ii]) continue;
+                        DxClass *iface = dx_vm_find_class(vm, cls->interfaces[ii]);
+                        if (!iface || iface->virtual_method_count == 0) continue;
+
+                        int idx = cls->itable_count;
+                        cls->itable[idx].interface_desc = cls->interfaces[ii];
+                        cls->itable[idx].method_count = (int)iface->virtual_method_count;
+                        cls->itable[idx].methods = (DxMethod **)dx_malloc(
+                            sizeof(DxMethod *) * iface->virtual_method_count);
+                        if (!cls->itable[idx].methods) continue;
+
+                        for (uint32_t im = 0; im < iface->virtual_method_count; im++) {
+                            DxMethod *imethod = &iface->virtual_methods[im];
+                            // Search the class vtable for a matching method
+                            DxMethod *resolved = NULL;
+                            for (uint32_t v = 0; v < cls->vtable_size; v++) {
+                                if (cls->vtable[v] &&
+                                    strcmp(cls->vtable[v]->name, imethod->name) == 0 &&
+                                    cls->vtable[v]->shorty && imethod->shorty &&
+                                    strcmp(cls->vtable[v]->shorty, imethod->shorty) == 0) {
+                                    resolved = cls->vtable[v];
+                                    break;
+                                }
+                            }
+                            // Also check direct methods (for static interface methods etc.)
+                            if (!resolved) {
+                                resolved = dx_vm_find_method(cls, imethod->name, imethod->shorty);
+                            }
+                            cls->itable[idx].methods[im] = resolved; // may be NULL
+                        }
+                        cls->itable_count++;
                     }
                 }
             }
@@ -4228,13 +4310,24 @@ DxResult dx_vm_init_class(DxVM *vm, DxClass *cls) {
 
 // ── Mark-and-sweep garbage collection ──
 
+// Check if a class is a WeakReference or SoftReference type
+static bool gc_is_weak_ref_class(DxClass *cls) {
+    if (!cls || !cls->descriptor) return false;
+    return (strstr(cls->descriptor, "WeakReference") != NULL ||
+            strstr(cls->descriptor, "SoftReference") != NULL);
+}
+
 static void gc_mark_object(DxObject *obj) {
     if (!obj || obj->gc_mark) return;
     obj->gc_mark = true;
 
     // Mark objects referenced by instance fields
     if (obj->fields && obj->klass) {
+        bool is_weak = gc_is_weak_ref_class(obj->klass);
         for (uint32_t i = 0; i < obj->klass->instance_field_count; i++) {
+            // Skip the referent field (field[0]) on WeakReference/SoftReference
+            // so that weak referents don't prevent collection
+            if (is_weak && i == 0) continue;
             if (obj->fields[i].tag == DX_VAL_OBJ && obj->fields[i].obj) {
                 gc_mark_object(obj->fields[i].obj);
             }
@@ -4251,6 +4344,204 @@ static void gc_mark_object(DxObject *obj) {
     }
 }
 
+// Forward declarations for incremental GC
+static void gc_clear_weak_refs(DxVM *vm);
+static void gc_mark_ui_tree(DxUINode *node);
+
+// ── Mark stack helpers for incremental GC (non-recursive marking) ──
+
+static void gc_mark_stack_push(DxVM *vm, DxObject *obj) {
+    if (!obj || obj->gc_mark) return;
+    if (vm->gc_mark_stack_top >= DX_GC_MARK_STACK_SIZE) {
+        // Overflow: fall back to immediate recursive mark
+        gc_mark_object(obj);
+        return;
+    }
+    obj->gc_mark = true;
+    vm->gc_mark_stack[vm->gc_mark_stack_top++] = obj;
+}
+
+// Process one object from the mark stack: mark its children (pushing them)
+static void gc_mark_stack_process_one(DxVM *vm) {
+    if (vm->gc_mark_stack_top == 0) return;
+    DxObject *obj = vm->gc_mark_stack[--vm->gc_mark_stack_top];
+    if (!obj) return;
+
+    // Trace instance fields
+    if (obj->fields && obj->klass) {
+        bool is_weak = gc_is_weak_ref_class(obj->klass);
+        for (uint32_t i = 0; i < obj->klass->instance_field_count; i++) {
+            if (is_weak && i == 0) continue;
+            if (obj->fields[i].tag == DX_VAL_OBJ && obj->fields[i].obj) {
+                gc_mark_stack_push(vm, obj->fields[i].obj);
+            }
+        }
+    }
+
+    // Trace array elements
+    if (obj->is_array && obj->array_elements) {
+        for (uint32_t i = 0; i < obj->array_length; i++) {
+            if (obj->array_elements[i].tag == DX_VAL_OBJ && obj->array_elements[i].obj) {
+                gc_mark_stack_push(vm, obj->array_elements[i].obj);
+            }
+        }
+    }
+}
+
+// Push all GC roots onto the mark stack (used to start incremental marking)
+static void gc_push_roots(DxVM *vm) {
+    // Root 1: activity instance
+    gc_mark_stack_push(vm, vm->activity_instance);
+
+    // Root 2: all registers in the current frame chain
+    DxFrame *frame = vm->current_frame;
+    while (frame) {
+        if (frame->method && frame->method->has_code) {
+            uint32_t reg_count = frame->method->code.registers_size;
+            if (reg_count > DX_MAX_REGISTERS) reg_count = DX_MAX_REGISTERS;
+            for (uint32_t r = 0; r < reg_count; r++) {
+                if (frame->registers[r].tag == DX_VAL_OBJ && frame->registers[r].obj) {
+                    gc_mark_stack_push(vm, frame->registers[r].obj);
+                }
+            }
+        }
+        if (frame->result.tag == DX_VAL_OBJ && frame->result.obj) {
+            gc_mark_stack_push(vm, frame->result.obj);
+        }
+        if (frame->exception) {
+            gc_mark_stack_push(vm, frame->exception);
+        }
+        frame = frame->caller;
+    }
+
+    // Root 3: static fields of all loaded classes
+    for (uint32_t c = 0; c < vm->class_count; c++) {
+        DxClass *cls = vm->classes[c];
+        if (!cls || !cls->static_fields) continue;
+        for (uint32_t f = 0; f < cls->static_field_count; f++) {
+            if (cls->static_fields[f].tag == DX_VAL_OBJ && cls->static_fields[f].obj) {
+                gc_mark_stack_push(vm, cls->static_fields[f].obj);
+            }
+        }
+    }
+
+    // Root 4: UI tree nodes
+    if (vm->ctx && vm->ctx->ui_root) {
+        gc_mark_ui_tree(vm->ctx->ui_root);
+    }
+
+    // Root 5: interned strings
+    for (uint32_t i = 0; i < vm->interned_count; i++) {
+        if (vm->interned_strings[i].obj) {
+            gc_mark_stack_push(vm, vm->interned_strings[i].obj);
+        }
+    }
+}
+
+// Incremental GC step: processes up to max_objects in the current phase
+static void gc_incremental_step(DxVM *vm, int max_objects) {
+    if (!vm) return;
+
+    if (vm->gc_phase == DX_GC_IDLE) {
+        // Start a new incremental cycle: clear marks, push roots, enter MARKING
+        for (uint32_t i = 0; i < vm->heap_count; i++) {
+            if (vm->heap[i]) vm->heap[i]->gc_mark = false;
+        }
+        vm->gc_mark_stack_top = 0;
+        gc_push_roots(vm);
+        vm->gc_phase = DX_GC_MARKING;
+        DX_INFO(TAG, "Incremental GC started: %u objects in heap", vm->heap_count);
+        return;  // roots pushed; actual marking starts on next step
+    }
+
+    if (vm->gc_phase == DX_GC_MARKING) {
+        int processed = 0;
+        while (vm->gc_mark_stack_top > 0 && processed < max_objects) {
+            gc_mark_stack_process_one(vm);
+            processed++;
+        }
+        if (vm->gc_mark_stack_top == 0) {
+            // Marking complete, transition to sweep phase
+            vm->gc_sweep_cursor = 0;
+            vm->gc_phase = DX_GC_SWEEPING;
+            DX_TRACE(TAG, "Incremental GC: mark phase complete, starting sweep");
+        }
+        return;
+    }
+
+    if (vm->gc_phase == DX_GC_SWEEPING) {
+        uint32_t before = vm->heap_count;
+        int processed = 0;
+        // We sweep from gc_sweep_cursor; compact into the same array
+        // For simplicity, we do the compaction in one final pass when sweep completes
+        // During incremental sweep, we just free unmarked objects and NULL their slots
+        while (vm->gc_sweep_cursor < vm->heap_count && processed < max_objects) {
+            DxObject *obj = vm->heap[vm->gc_sweep_cursor];
+            if (obj && !obj->gc_mark) {
+                dx_free(obj->fields);
+                dx_free(obj->array_elements);
+                dx_free(obj);
+                vm->heap[vm->gc_sweep_cursor] = NULL;
+            }
+            vm->gc_sweep_cursor++;
+            processed++;
+        }
+
+        if (vm->gc_sweep_cursor >= vm->heap_count) {
+            // Sweep complete: compact the heap
+            uint32_t write = 0;
+            for (uint32_t i = 0; i < vm->heap_count; i++) {
+                if (vm->heap[i]) {
+                    vm->heap[i]->heap_idx = write;
+                    vm->heap[write++] = vm->heap[i];
+                }
+            }
+            for (uint32_t i = write; i < vm->heap_count; i++) {
+                vm->heap[i] = NULL;
+            }
+            uint32_t freed = vm->heap_count - write;
+            vm->heap_count = write;
+
+            gc_clear_weak_refs(vm);
+
+            vm->gc_phase = DX_GC_IDLE;
+            DX_INFO(TAG, "Incremental GC completed: %u -> %u objects (%u freed)",
+                    before, write, freed);
+        }
+        return;
+    }
+}
+
+// After sweep, clear referent (field[0]) of surviving WeakReference/SoftReference
+// objects whose referent was collected
+static void gc_clear_weak_refs(DxVM *vm) {
+    for (uint32_t i = 0; i < vm->heap_count; i++) {
+        DxObject *obj = vm->heap[i];
+        if (!obj || !obj->klass || !obj->fields) continue;
+        if (!gc_is_weak_ref_class(obj->klass)) continue;
+        if (obj->klass->instance_field_count == 0) continue;
+
+        // field[0] is the referent — if it points to a swept object, null it out
+        if (obj->fields[0].tag == DX_VAL_OBJ && obj->fields[0].obj) {
+            DxObject *referent = obj->fields[0].obj;
+            // The referent was not marked (it was swept), so it's now a dangling ptr.
+            // We detect this by checking gc_mark: after sweep, surviving objects
+            // have gc_mark == true. If referent was swept, its memory is freed.
+            // Instead, we check whether the referent is still in the heap.
+            bool found = false;
+            for (uint32_t h = 0; h < vm->heap_count; h++) {
+                if (vm->heap[h] == referent) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                obj->fields[0] = DX_NULL_VALUE;
+            }
+        }
+    }
+}
+
 static void gc_mark_ui_tree(DxUINode *node) {
     if (!node) return;
     if (node->runtime_obj) gc_mark_object(node->runtime_obj);
@@ -4262,6 +4553,11 @@ static void gc_mark_ui_tree(DxUINode *node) {
 
 void dx_vm_gc(DxVM *vm) {
     if (!vm) return;
+
+    uint64_t gc_start_ns = 0;
+    if (vm->profiling_enabled) {
+        gc_start_ns = dx_vm_time_ns();
+    }
 
     uint32_t before = vm->heap_count;
     DX_INFO(TAG, "GC started: %u objects in heap", before);
@@ -4345,7 +4641,22 @@ void dx_vm_gc(DxVM *vm) {
     }
 
     vm->heap_count = write;
+
+    // Clear referent fields of surviving WeakReference/SoftReference objects
+    // whose referents were swept
+    gc_clear_weak_refs(vm);
+
     DX_INFO(TAG, "GC completed: %u -> %u objects (%u freed)", before, write, before - write);
+
+    // Profiling: record GC pause time
+    if (vm->profiling_enabled && gc_start_ns > 0) {
+        uint64_t pause_ns = dx_vm_time_ns() - gc_start_ns;
+        vm->last_gc_pause_ns = pause_ns;
+        vm->total_gc_pause_ns += pause_ns;
+        DX_INFO(TAG, "GC pause: %.3f ms (total: %.3f ms)",
+                (double)pause_ns / 1000000.0,
+                (double)vm->total_gc_pause_ns / 1000000.0);
+    }
 }
 
 DxObject *dx_vm_alloc_object(DxVM *vm, DxClass *cls) {
@@ -4399,6 +4710,15 @@ DxObject *dx_vm_alloc_object(DxVM *vm, DxClass *cls) {
     }
 
     vm->heap[vm->heap_count++] = obj;
+
+    // Profiling: track allocation count and bytes
+    if (vm->profiling_enabled) {
+        vm->total_allocations++;
+        vm->total_bytes_allocated += sizeof(DxObject);
+        if (cls->instance_field_count > 0) {
+            vm->total_bytes_allocated += sizeof(DxValue) * cls->instance_field_count;
+        }
+    }
 
     DX_TRACE(TAG, "Allocated %s (heap[%u])", cls->descriptor, obj->heap_idx);
     return obj;
@@ -4473,9 +4793,20 @@ DxResult dx_vm_set_field(DxObject *obj, const char *name, DxValue value) {
         if (cls->field_defs && own_count > 0) {
             for (uint32_t i = 0; i < own_count; i++) {
                 if (cls->field_defs[i].name && strcmp(cls->field_defs[i].name, name) == 0) {
-                    uint32_t slot = super_count + i;
+                    // Use precomputed slot_index if available, otherwise compute
+                    uint32_t slot = cls->field_defs[i].slot_index;
+                    if (slot == 0 && i > 0) {
+                        // Fallback for framework classes without precomputed slots
+                        slot = super_count + i;
+                    }
                     if (obj->fields && slot < total_fields) {
+                        if (cls->field_defs[i].is_volatile) {
+                            __sync_synchronize();  // store-store barrier before volatile write
+                        }
                         obj->fields[slot] = value;
+                        if (cls->field_defs[i].is_volatile) {
+                            __sync_synchronize();  // store-load barrier after volatile write
+                        }
                         return DX_OK;
                     }
                 }
@@ -4504,9 +4835,17 @@ DxResult dx_vm_get_field(DxObject *obj, const char *name, DxValue *out) {
         if (cls->field_defs && own_count > 0) {
             for (uint32_t i = 0; i < own_count; i++) {
                 if (cls->field_defs[i].name && strcmp(cls->field_defs[i].name, name) == 0) {
-                    uint32_t slot = super_count + i;
+                    // Use precomputed slot_index if available, otherwise compute
+                    uint32_t slot = cls->field_defs[i].slot_index;
+                    if (slot == 0 && i > 0) {
+                        // Fallback for framework classes without precomputed slots
+                        slot = super_count + i;
+                    }
                     if (obj->fields && slot < total_fields) {
                         *out = obj->fields[slot];
+                        if (cls->field_defs[i].is_volatile) {
+                            __sync_synchronize();  // load-load/load-store barrier after volatile read
+                        }
                         return DX_OK;
                     }
                 }
@@ -4655,6 +4994,25 @@ DxMethod *dx_vm_find_method(DxClass *cls, const char *name, const char *shorty) 
 // Handles diamond inheritance by preferring sub-interfaces over parent interfaces.
 DxMethod *dx_vm_find_interface_method(DxVM *vm, DxClass *cls, const char *name, const char *shorty) {
     if (!vm || !cls || !name) return NULL;
+
+    // Fast path: check itable for O(1) lookup on the receiver's class
+    if (cls->itable && cls->itable_count > 0) {
+        for (int it = 0; it < cls->itable_count; it++) {
+            const char *iface_desc = cls->itable[it].interface_desc;
+            DxClass *iface = dx_vm_find_class(vm, iface_desc);
+            if (!iface) continue;
+            for (int im = 0; im < cls->itable[it].method_count; im++) {
+                if ((uint32_t)im >= iface->virtual_method_count) break;
+                DxMethod *imethod = &iface->virtual_methods[im];
+                if (strcmp(imethod->name, name) != 0) continue;
+                if (shorty && imethod->shorty && strcmp(imethod->shorty, shorty) != 0) continue;
+                DxMethod *resolved = cls->itable[it].methods[im];
+                if (resolved && (resolved->has_code || resolved->is_native)) {
+                    return resolved;
+                }
+            }
+        }
+    }
 
     DxMethod *best = NULL;
 
@@ -5361,6 +5719,13 @@ void dx_vm_gc_collect(DxVM *vm) {
     dx_vm_gc(vm);
 }
 
+// ─── Incremental GC public API ───
+
+void dx_vm_gc_step(DxVM *vm) {
+    if (!vm) return;
+    gc_incremental_step(vm, 256);
+}
+
 // ─── Missing feature tracking ───
 
 void dx_vm_report_missing_feature(DxVM *vm, const char *feature) {
@@ -5418,4 +5783,242 @@ void dx_vm_set_trace_filter(DxVM *vm, const char *method_filter) {
     if (!vm) return;
     vm->debug.trace_method_filter = method_filter;
     DX_INFO(TAG, "Trace filter: %s", method_filter ? method_filter : "(all)");
+}
+
+// ---- Inline Cache Operations ----
+
+// Get (or lazily create) the inline cache for a call site at the given PC in a method.
+// Uses a simple open-addressing hash table keyed by PC offset.
+DxInlineCache *dx_vm_ic_get(DxMethod *method, uint32_t pc) {
+    if (!method) return NULL;
+
+    // Lazily allocate the IC table on first use
+    if (!method->ic_table) {
+        method->ic_table = (DxICTable *)dx_malloc(sizeof(DxICTable));
+        if (!method->ic_table) return NULL;
+        memset(method->ic_table, 0, sizeof(DxICTable));
+    }
+
+    DxICTable *table = method->ic_table;
+    // We store pc+1 so that 0 means "empty slot" (pc=0 is a valid offset)
+    uint32_t key = pc + 1;
+    uint32_t idx = pc % DX_IC_TABLE_SIZE;
+
+    // Linear probe to find existing or empty slot
+    for (uint32_t i = 0; i < DX_IC_TABLE_SIZE; i++) {
+        uint32_t slot = (idx + i) % DX_IC_TABLE_SIZE;
+        if (table->slots[slot].pc == key) {
+            return &table->slots[slot].ic;
+        }
+        if (table->slots[slot].pc == 0) {
+            // Empty slot — claim it for this PC
+            table->slots[slot].pc = key;
+            return &table->slots[slot].ic;
+        }
+    }
+
+    // Table full (shouldn't happen with 32 slots for typical methods)
+    return NULL;
+}
+
+// Look up a cached method for the given receiver class. Returns NULL on miss.
+DxMethod *dx_vm_ic_lookup(DxInlineCache *ic, DxClass *receiver_class) {
+    if (!ic || !receiver_class) return NULL;
+
+    for (uint8_t i = 0; i < ic->count; i++) {
+        if (ic->entries[i].receiver_class == receiver_class) {
+            ic->hits++;
+            return ic->entries[i].resolved_method;
+        }
+    }
+
+    ic->misses++;
+    return NULL;
+}
+
+// Insert a resolved method into the inline cache for a receiver class.
+void dx_vm_ic_insert(DxInlineCache *ic, DxClass *receiver_class, DxMethod *resolved) {
+    if (!ic || !receiver_class || !resolved) return;
+
+    // Check if already present (avoid duplicates)
+    for (uint8_t i = 0; i < ic->count; i++) {
+        if (ic->entries[i].receiver_class == receiver_class) {
+            ic->entries[i].resolved_method = resolved;
+            return;
+        }
+    }
+
+    if (ic->count < DX_IC_SIZE) {
+        // Append to cache
+        ic->entries[ic->count].receiver_class = receiver_class;
+        ic->entries[ic->count].resolved_method = resolved;
+        ic->count++;
+    } else {
+        // Cache full — evict oldest (slot 0) and shift
+        for (uint8_t i = 1; i < DX_IC_SIZE; i++) {
+            ic->entries[i - 1] = ic->entries[i];
+        }
+        ic->entries[DX_IC_SIZE - 1].receiver_class = receiver_class;
+        ic->entries[DX_IC_SIZE - 1].resolved_method = resolved;
+    }
+}
+
+// Log aggregate inline cache statistics across all loaded methods.
+void dx_vm_ic_stats(DxVM *vm) {
+    if (!vm) return;
+
+    uint64_t total_hits = 0;
+    uint64_t total_misses = 0;
+    uint32_t total_sites = 0;
+    uint32_t monomorphic = 0;
+    uint32_t polymorphic = 0;
+    uint32_t megamorphic = 0;
+
+    for (uint32_t c = 0; c < vm->class_count; c++) {
+        DxClass *cls = vm->classes[c];
+        if (!cls) continue;
+
+        // Scan both direct and virtual methods
+        DxMethod *method_lists[2] = { cls->direct_methods, cls->virtual_methods };
+        uint32_t  method_counts[2] = { cls->direct_method_count, cls->virtual_method_count };
+
+        for (int ml = 0; ml < 2; ml++) {
+            for (uint32_t m = 0; m < method_counts[ml]; m++) {
+                DxMethod *method = &method_lists[ml][m];
+                if (!method->ic_table) continue;
+
+                DxICTable *table = method->ic_table;
+                for (uint32_t s = 0; s < DX_IC_TABLE_SIZE; s++) {
+                    if (table->slots[s].pc == 0) continue;
+                    DxInlineCache *ic = &table->slots[s].ic;
+                    total_hits += ic->hits;
+                    total_misses += ic->misses;
+                    total_sites++;
+
+                    if (ic->count == 1) monomorphic++;
+                    else if (ic->count > 1 && ic->count <= DX_IC_SIZE) polymorphic++;
+                    else if (ic->count >= DX_IC_SIZE) megamorphic++;
+                }
+            }
+        }
+    }
+
+    uint64_t total = total_hits + total_misses;
+    double hit_rate = total > 0 ? (double)total_hits / (double)total * 100.0 : 0.0;
+
+    DX_INFO(TAG, "Inline cache stats: %u sites, %llu hits, %llu misses, %.1f%% hit rate",
+            total_sites, total_hits, total_misses, hit_rate);
+    DX_INFO(TAG, "  Monomorphic: %u, Polymorphic: %u, Megamorphic: %u",
+            monomorphic, polymorphic, megamorphic);
+}
+
+// ─── Profiling API ───────────────────────────────────────────────────────────
+
+void dx_vm_set_profiling(DxVM *vm, bool enabled) {
+    if (!vm) return;
+    vm->profiling_enabled = enabled;
+    if (enabled) {
+        DX_INFO(TAG, "Profiling enabled");
+    } else {
+        DX_INFO(TAG, "Profiling disabled");
+    }
+}
+
+void dx_vm_dump_opcode_stats(DxVM *vm) {
+    if (!vm) return;
+
+    // Find the top 20 most frequent opcodes
+    typedef struct { uint8_t opcode; uint64_t count; } OpcodeEntry;
+    OpcodeEntry entries[256];
+    for (int i = 0; i < 256; i++) {
+        entries[i].opcode = (uint8_t)i;
+        entries[i].count = vm->opcode_histogram[i];
+    }
+
+    // Simple selection sort for top 20
+    for (int i = 0; i < 20 && i < 256; i++) {
+        int max_idx = i;
+        for (int j = i + 1; j < 256; j++) {
+            if (entries[j].count > entries[max_idx].count) {
+                max_idx = j;
+            }
+        }
+        if (max_idx != i) {
+            OpcodeEntry tmp = entries[i];
+            entries[i] = entries[max_idx];
+            entries[max_idx] = tmp;
+        }
+    }
+
+    DX_INFO(TAG, "=== Opcode Frequency (top 20) ===");
+    uint64_t total = 0;
+    for (int i = 0; i < 256; i++) total += vm->opcode_histogram[i];
+
+    for (int i = 0; i < 20 && entries[i].count > 0; i++) {
+        double pct = total > 0 ? (double)entries[i].count / (double)total * 100.0 : 0.0;
+        DX_INFO(TAG, "  #%2d  0x%02x %-30s  %llu  (%.1f%%)",
+                i + 1, entries[i].opcode, dx_opcode_name(entries[i].opcode),
+                entries[i].count, pct);
+    }
+    DX_INFO(TAG, "  Total instructions profiled: %llu", total);
+}
+
+void dx_vm_dump_hot_methods(DxVM *vm, int top_n) {
+    if (!vm || top_n <= 0) return;
+
+    // Collect all methods with call_count > 0
+    typedef struct { DxMethod *method; } MethodRef;
+    #define MAX_PROFILED_METHODS 4096
+    MethodRef refs[MAX_PROFILED_METHODS];
+    int ref_count = 0;
+
+    for (uint32_t c = 0; c < vm->class_count && ref_count < MAX_PROFILED_METHODS; c++) {
+        DxClass *cls = vm->classes[c];
+        if (!cls) continue;
+
+        DxMethod *method_lists[2] = { cls->direct_methods, cls->virtual_methods };
+        uint32_t  method_counts[2] = { cls->direct_method_count, cls->virtual_method_count };
+
+        for (int ml = 0; ml < 2; ml++) {
+            for (uint32_t m = 0; m < method_counts[ml] && ref_count < MAX_PROFILED_METHODS; m++) {
+                DxMethod *method = &method_lists[ml][m];
+                if (method->call_count > 0) {
+                    refs[ref_count++].method = method;
+                }
+            }
+        }
+    }
+
+    // Sort by total_time_ns descending (selection sort for top_n)
+    int limit = top_n < ref_count ? top_n : ref_count;
+    for (int i = 0; i < limit; i++) {
+        int max_idx = i;
+        for (int j = i + 1; j < ref_count; j++) {
+            if (refs[j].method->total_time_ns > refs[max_idx].method->total_time_ns) {
+                max_idx = j;
+            }
+        }
+        if (max_idx != i) {
+            MethodRef tmp = refs[i];
+            refs[i] = refs[max_idx];
+            refs[max_idx] = tmp;
+        }
+    }
+
+    DX_INFO(TAG, "=== Hot Methods (top %d by total time) ===", limit);
+    for (int i = 0; i < limit; i++) {
+        DxMethod *m = refs[i].method;
+        const char *cls_name = m->declaring_class ? m->declaring_class->descriptor : "?";
+        const char *mth_name = m->name ? m->name : "?";
+        double total_ms = (double)m->total_time_ns / 1000000.0;
+        double avg_us = m->call_count > 0 ? (double)m->total_time_ns / (double)m->call_count / 1000.0 : 0.0;
+        DX_INFO(TAG, "  #%2d  %s.%s  calls=%u  total=%.3f ms  avg=%.1f us",
+                i + 1, cls_name, mth_name, m->call_count, total_ms, avg_us);
+    }
+    DX_INFO(TAG, "  Heap: %llu allocations, %llu bytes total",
+            vm->total_allocations, vm->total_bytes_allocated);
+    DX_INFO(TAG, "  GC: last pause=%.3f ms, total pause=%.3f ms",
+            (double)vm->last_gc_pause_ns / 1000000.0,
+            (double)vm->total_gc_pause_ns / 1000000.0);
+    #undef MAX_PROFILED_METHODS
 }

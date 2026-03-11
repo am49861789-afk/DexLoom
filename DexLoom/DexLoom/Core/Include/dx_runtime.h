@@ -81,4 +81,16 @@ bool dx_runtime_perform_network_request(const DxNetworkRequest *request, DxNetwo
 // Free a network response (frees body and header arrays)
 void dx_network_response_free(DxNetworkResponse *response);
 
+// ============================================================
+// File system sandboxing
+// ============================================================
+
+// Set the sandbox root directory. Only paths under this root (and relative
+// paths without traversal) are permitted.  Pass NULL to disable sandboxing.
+void dx_runtime_set_sandbox_root(const char *root);
+
+// Check whether *path* is allowed under the current sandbox policy.
+// Returns true if the path is permitted, false (and logs a warning) if denied.
+bool dx_runtime_check_file_path(const char *path);
+
 #endif // DX_RUNTIME_H

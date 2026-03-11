@@ -1430,3 +1430,57 @@ void dx_network_response_free(DxNetworkResponse *response) {
     if (response->header_values) { free(response->header_values); response->header_values = NULL; }
     response->header_count = 0;
 }
+
+// ============================================================
+// File system sandboxing
+// ============================================================
+
+static char *g_sandbox_root = NULL;
+
+void dx_runtime_set_sandbox_root(const char *root) {
+    if (g_sandbox_root) {
+        free(g_sandbox_root);
+        g_sandbox_root = NULL;
+    }
+    if (root) {
+        g_sandbox_root = strdup(root);
+        DX_INFO(TAG, "Sandbox root set to: %s", root);
+    } else {
+        DX_INFO(TAG, "Sandbox disabled");
+    }
+}
+
+bool dx_runtime_check_file_path(const char *path) {
+    if (!path) return false;
+
+    // Reject ".." traversal anywhere in the path
+    if (strstr(path, "..")) {
+        DX_WARN(TAG, "Sandbox: rejected path with traversal: %s", path);
+        return false;
+    }
+
+    // Reject dangerous system paths
+    static const char *blocked[] = { "/proc/", "/sys/", "/dev/" };
+    for (int i = 0; i < 3; i++) {
+        if (strstr(path, blocked[i])) {
+            DX_WARN(TAG, "Sandbox: rejected system path: %s", path);
+            return false;
+        }
+    }
+
+    // If a sandbox root is set, absolute paths must be under it
+    if (g_sandbox_root && path[0] == '/') {
+        size_t root_len = strlen(g_sandbox_root);
+        if (strncmp(path, g_sandbox_root, root_len) != 0) {
+            DX_WARN(TAG, "Sandbox: rejected path outside root: %s", path);
+            return false;
+        }
+        // Ensure the next char is '/' or end-of-string to prevent prefix tricks
+        if (path[root_len] != '\0' && path[root_len] != '/') {
+            DX_WARN(TAG, "Sandbox: rejected path outside root: %s", path);
+            return false;
+        }
+    }
+
+    return true;
+}

@@ -7,6 +7,7 @@ struct InspectorTabView: View {
     enum InspectorType: String, CaseIterable {
         case dexBrowser = "DEX Browser"
         case manifest = "Manifest"
+        case resources = "Resources"
     }
 
     var body: some View {
@@ -28,6 +29,8 @@ struct InspectorTabView: View {
                 DEXBrowserView(bridge: bridge)
             case .manifest:
                 ManifestInspectorView(bridge: bridge)
+            case .resources:
+                ResourceInspectorView(bridge: bridge)
             }
         }
     }

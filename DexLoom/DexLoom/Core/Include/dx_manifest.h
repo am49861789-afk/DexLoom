@@ -41,6 +41,12 @@ typedef struct {
     bool  required;     // android:required (default true)
 } DxUsesLibrary;
 
+// --- Instrumentation ---
+typedef struct {
+    char *name;            // android:name (fully qualified class)
+    char *target_package;  // android:targetPackage
+} DxInstrumentation;
+
 // --- Component (activity/service/receiver/provider) ---
 typedef struct {
     char            *name;          // fully qualified class name
@@ -94,6 +100,10 @@ typedef struct {
     // Uses-library list
     DxUsesLibrary *libraries;
     uint32_t       library_count;
+
+    // Instrumentation list
+    DxInstrumentation *instrumentations;
+    uint32_t           instrumentation_count;
 } DxManifest;
 
 // Parse Android Binary XML manifest from raw bytes
@@ -105,6 +115,17 @@ const DxComponent *dx_manifest_find_activity(const DxManifest *m, const char *na
 const DxComponent *dx_manifest_find_service(const DxManifest *m, const char *name);
 const DxComponent *dx_manifest_find_receiver(const DxManifest *m, const char *name);
 
+// AXML attribute with namespace tracking
+typedef struct {
+    const char *namespace_uri;  // namespace URI (e.g. "http://schemas.android.com/apk/res/android"), NULL if none
+    const char *name;           // attribute local name
+    uint32_t    name_idx;       // string pool index for the name
+    uint32_t    ns_idx;         // string pool index for namespace URI (0xFFFFFFFF if none)
+    uint32_t    resource_id;    // resolved resource ID (0 if none)
+    uint32_t    value_type;     // ATTR_TYPE_* constant
+    uint32_t    value_data;     // raw value data
+} DxAxmlAttribute;
+
 // AXML (Android Binary XML) low-level parser
 typedef struct {
     // String pool
@@ -114,6 +135,12 @@ typedef struct {
     // Resource ID map
     uint32_t  *res_ids;
     uint32_t   res_id_count;
+
+    // Namespace map (active namespace prefix -> URI bindings)
+    char     **ns_prefixes;     // prefix strings (owned copies)
+    char     **ns_uris;         // URI strings (owned copies)
+    uint32_t   ns_count;        // number of active bindings
+    uint32_t   ns_capacity;     // allocated capacity
 } DxAxmlParser;
 
 DxResult dx_axml_parse(const uint8_t *data, uint32_t size, DxAxmlParser **out);

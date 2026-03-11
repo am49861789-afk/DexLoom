@@ -3,6 +3,8 @@
 #include "../Include/dx_log.h"
 #include <stdlib.h>
 #include <string.h>
+#include <zlib.h>
+#include <CommonCrypto/CommonDigest.h>
 
 #define TAG "DEX"
 
@@ -127,6 +129,131 @@ DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
                 dex->header.file_size, size);
     }
 
+    // Adler32 checksum validation (over bytes 12..file_size)
+    if (size > 12) {
+        uLong computed_checksum = adler32(1L, data + 12, size - 12);
+        if ((uint32_t)computed_checksum != dex->header.checksum) {
+            DX_WARN(TAG, "DEX checksum mismatch: expected 0x%08x, got 0x%08x",
+                    dex->header.checksum, (uint32_t)computed_checksum);
+        }
+    }
+
+    // SHA-1 signature validation (over bytes 32..file_size)
+    if (size > 32) {
+        uint8_t computed_sha1[CC_SHA1_DIGEST_LENGTH];
+        CC_SHA1(data + 32, (CC_LONG)(size - 32), computed_sha1);
+        if (memcmp(computed_sha1, dex->header.signature, 20) != 0) {
+            DX_WARN(TAG, "DEX SHA-1 signature mismatch");
+        }
+    }
+
+    // Hidden API metadata detection (DEX version 039+)
+    if (memcmp(version, "039", 3) >= 0) {
+        DX_INFO(TAG, "DEX 039+: hidden API restrictions may apply");
+    }
+
+    // Initialize map items
+    dex->map_items = NULL;
+    dex->map_item_count = 0;
+
+    // Parse map section
+    {
+        uint32_t map_off = dex->header.map_off;
+        if (map_off != 0 && map_off + 4 <= size) {
+            uint32_t map_count = read_u32(data + map_off);
+            if (map_count > 0 && map_off + 4 + (uint64_t)map_count * 12 <= size) {
+                dex->map_items = (DxMapItem *)dx_malloc(sizeof(DxMapItem) * map_count);
+                if (dex->map_items) {
+                    dex->map_item_count = map_count;
+                    const uint8_t *mp = data + map_off + 4;
+                    for (uint32_t i = 0; i < map_count; i++) {
+                        dex->map_items[i].type = read_u16(mp + i * 12);
+                        // mp + i*12 + 2 is unused uint16
+                        dex->map_items[i].size = read_u32(mp + i * 12 + 4);
+                        dex->map_items[i].offset = read_u32(mp + i * 12 + 8);
+                    }
+                    DX_INFO(TAG, "Parsed %u map items", map_count);
+                }
+            }
+        }
+    }
+
+    // Validate map_off and cross-check map items against header
+    if (dex->header.map_off != 0) {
+        uint32_t mo = dex->header.map_off;
+        if (mo + 4 > size) {
+            DX_WARN(TAG, "map_off 0x%x out of file bounds (size=0x%x)", mo, size);
+            dx_free(dex->map_items);
+            dex->map_items = NULL;
+            dex->map_item_count = 0;
+        } else {
+            uint32_t mc = read_u32(data + mo);
+            if (mc > 1000) {
+                DX_WARN(TAG, "map_list item count %u unreasonably large (>1000)", mc);
+            }
+            if (mo + 4 + (uint64_t)mc * 12 > size) {
+                DX_WARN(TAG, "map_list extends past file end (off=0x%x, count=%u)", mo, mc);
+            }
+            // Cross-check key map items against header offsets
+            // DEX map_list item type constants
+            #define MAP_TYPE_STRING_ID  0x0001
+            #define MAP_TYPE_TYPE_ID    0x0002
+            #define MAP_TYPE_PROTO_ID   0x0003
+            #define MAP_TYPE_FIELD_ID   0x0004
+            #define MAP_TYPE_METHOD_ID  0x0005
+            #define MAP_TYPE_CLASS_DEF  0x0006
+            for (uint32_t mi = 0; mi < dex->map_item_count; mi++) {
+                DxMapItem *item = &dex->map_items[mi];
+                uint32_t expected_off = 0;
+                uint32_t expected_size = 0;
+                switch (item->type) {
+                    case MAP_TYPE_STRING_ID:
+                        expected_off = dex->header.string_ids_off;
+                        expected_size = dex->header.string_ids_size;
+                        break;
+                    case MAP_TYPE_TYPE_ID:
+                        expected_off = dex->header.type_ids_off;
+                        expected_size = dex->header.type_ids_size;
+                        break;
+                    case MAP_TYPE_PROTO_ID:
+                        expected_off = dex->header.proto_ids_off;
+                        expected_size = dex->header.proto_ids_size;
+                        break;
+                    case MAP_TYPE_FIELD_ID:
+                        expected_off = dex->header.field_ids_off;
+                        expected_size = dex->header.field_ids_size;
+                        break;
+                    case MAP_TYPE_METHOD_ID:
+                        expected_off = dex->header.method_ids_off;
+                        expected_size = dex->header.method_ids_size;
+                        break;
+                    case MAP_TYPE_CLASS_DEF:
+                        expected_off = dex->header.class_defs_off;
+                        expected_size = dex->header.class_defs_size;
+                        break;
+                    default:
+                        continue; // skip non-header-referenced types
+                }
+                if (expected_size > 0) {
+                    if (item->offset != expected_off) {
+                        DX_WARN(TAG, "map item type 0x%04x offset 0x%x != header offset 0x%x",
+                                item->type, item->offset, expected_off);
+                    }
+                    if (item->size != expected_size) {
+                        DX_WARN(TAG, "map item type 0x%04x size %u != header size %u",
+                                item->type, item->size, expected_size);
+                    }
+                }
+            }
+            #undef MAP_TYPE_STRING_ID
+            #undef MAP_TYPE_TYPE_ID
+            #undef MAP_TYPE_PROTO_ID
+            #undef MAP_TYPE_FIELD_ID
+            #undef MAP_TYPE_METHOD_ID
+            #undef MAP_TYPE_CLASS_DEF
+        }
+    }
+
     // Validate table offsets are within file bounds
     if (dex->header.string_ids_size > 0 &&
         (dex->header.string_ids_off >= size ||
@@ -177,33 +304,33 @@ DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
         return DX_ERR_INVALID_FORMAT;
     }
 
-    // Parse string table
+    // Parse string table — lazy: store only raw offsets, decode on first access
     dex->string_count = dex->header.string_ids_size;
-    if (dex->string_count > SIZE_MAX / sizeof(char *)) {
+    if (dex->string_count > 10000000) {  // 10M strings max
         DX_ERROR(TAG, "String count %u would overflow allocation", dex->string_count);
         dx_free(dex);
         return DX_ERR_INVALID_FORMAT;
     }
     dex->strings = (char **)dx_malloc(sizeof(char *) * dex->string_count);
     if (!dex->strings) goto fail;
+    // strings[] initialized to NULL by dx_malloc (lazy decode on first access)
+
+    dex->string_data_offsets = (uint32_t *)dx_malloc(sizeof(uint32_t) * dex->string_count);
+    if (!dex->string_data_offsets) goto fail;
 
     for (uint32_t i = 0; i < dex->string_count; i++) {
         uint32_t string_id_off = dex->header.string_ids_off + i * 4;
-        if (string_id_off + 4 > size) break;
-        uint32_t string_data_off = read_u32(data + string_id_off);
-        // Validate string data offset is within file bounds
-        if (string_data_off >= size) {
-            DX_WARN(TAG, "String %u data offset 0x%x out of bounds (file size 0x%x)",
-                    i, string_data_off, size);
-            dex->strings[i] = dx_strdup("");
+        if (string_id_off + 4 > size) {
+            dex->string_data_offsets[i] = UINT32_MAX; // sentinel: invalid
             continue;
         }
-        dex->strings[i] = decode_mutf8(data, string_data_off, size);
+        uint32_t string_data_off = read_u32(data + string_id_off);
+        dex->string_data_offsets[i] = string_data_off;
     }
 
     // Parse type IDs
     dex->type_count = dex->header.type_ids_size;
-    if (dex->type_count > SIZE_MAX / sizeof(DxDexTypeId)) {
+    if (dex->type_count > 10000000) {  // 10M types max
         DX_ERROR(TAG, "Type count %u would overflow allocation", dex->type_count);
         goto fail;
     }
@@ -217,7 +344,7 @@ DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
 
     // Parse proto IDs
     dex->proto_count = dex->header.proto_ids_size;
-    if (dex->proto_count > SIZE_MAX / sizeof(DxDexProtoId)) {
+    if (dex->proto_count > 10000000) {  // 10M protos max
         DX_ERROR(TAG, "Proto count %u would overflow allocation", dex->proto_count);
         goto fail;
     }
@@ -233,7 +360,7 @@ DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
 
     // Parse field IDs
     dex->field_count = dex->header.field_ids_size;
-    if (dex->field_count > SIZE_MAX / sizeof(DxDexFieldId)) {
+    if (dex->field_count > 10000000) {  // 10M fields max
         DX_ERROR(TAG, "Field count %u would overflow allocation", dex->field_count);
         goto fail;
     }
@@ -249,7 +376,7 @@ DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
 
     // Parse method IDs
     dex->method_count = dex->header.method_ids_size;
-    if (dex->method_count > SIZE_MAX / sizeof(DxDexMethodId)) {
+    if (dex->method_count > 10000000) {  // 10M methods max
         DX_ERROR(TAG, "Method count %u would overflow allocation", dex->method_count);
         goto fail;
     }
@@ -265,7 +392,7 @@ DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
 
     // Parse class definitions
     dex->class_count = dex->header.class_defs_size;
-    if (dex->class_count > SIZE_MAX / sizeof(DxDexClassDef)) {
+    if (dex->class_count > 5000000) {  // 5M classes max
         DX_ERROR(TAG, "Class count %u would overflow allocation", dex->class_count);
         goto fail;
     }
@@ -312,6 +439,7 @@ void dx_dex_free(DxDexFile *dex) {
         dx_free(dex->strings[i]);
     }
     dx_free(dex->strings);
+    dx_free(dex->string_data_offsets);
     dx_free(dex->type_ids);
     dx_free(dex->proto_ids);
     dx_free(dex->field_ids);
@@ -331,6 +459,7 @@ void dx_dex_free(DxDexFile *dex) {
         dx_free(dex->class_data);
     }
 
+    dx_free(dex->map_items);
     dx_free(dex->method_handles);
     dx_free(dex->call_sites);
 
@@ -339,6 +468,18 @@ void dx_dex_free(DxDexFile *dex) {
 
 const char *dx_dex_get_string(const DxDexFile *dex, uint32_t idx) {
     if (!dex || idx >= dex->string_count) return NULL;
+
+    // Lazy decode: if not yet decoded, decode from raw data now
+    if (!dex->strings[idx]) {
+        // Cast away const for lazy caching (strings[] is a mutable cache)
+        DxDexFile *mutable_dex = (DxDexFile *)dex;
+        uint32_t off = dex->string_data_offsets ? dex->string_data_offsets[idx] : UINT32_MAX;
+        if (off == UINT32_MAX || off >= dex->raw_size) {
+            mutable_dex->strings[idx] = dx_strdup("");
+        } else {
+            mutable_dex->strings[idx] = decode_mutf8(dex->raw_data, off, dex->raw_size);
+        }
+    }
     return dex->strings[idx];
 }
 
@@ -378,7 +519,7 @@ DxResult dx_dex_parse_class_data(DxDexFile *dex, uint32_t class_def_idx) {
 
     // Parse static fields
     if (static_fields_count > 0) {
-        if (static_fields_count > SIZE_MAX / sizeof(DxDexEncodedField)) {
+        if (static_fields_count > 100000) {  // 100K fields per class max
             dx_free(cd); return DX_ERR_INVALID_FORMAT;
         }
         cd->static_fields = (DxDexEncodedField *)dx_malloc(sizeof(DxDexEncodedField) * static_fields_count);
@@ -393,7 +534,7 @@ DxResult dx_dex_parse_class_data(DxDexFile *dex, uint32_t class_def_idx) {
 
     // Parse instance fields
     if (instance_fields_count > 0) {
-        if (instance_fields_count > SIZE_MAX / sizeof(DxDexEncodedField)) {
+        if (instance_fields_count > 100000) {  // 100K fields per class max
             dx_free(cd->static_fields); dx_free(cd); return DX_ERR_INVALID_FORMAT;
         }
         cd->instance_fields = (DxDexEncodedField *)dx_malloc(sizeof(DxDexEncodedField) * instance_fields_count);
@@ -408,7 +549,7 @@ DxResult dx_dex_parse_class_data(DxDexFile *dex, uint32_t class_def_idx) {
 
     // Parse direct methods
     if (direct_methods_count > 0) {
-        if (direct_methods_count > SIZE_MAX / sizeof(DxDexEncodedMethod)) goto fail_methods;
+        if (direct_methods_count > 100000) goto fail_methods;  // 100K methods per class max
         cd->direct_methods = (DxDexEncodedMethod *)dx_malloc(sizeof(DxDexEncodedMethod) * direct_methods_count);
         if (!cd->direct_methods) goto fail_methods;
         uint32_t method_idx = 0;
@@ -422,7 +563,7 @@ DxResult dx_dex_parse_class_data(DxDexFile *dex, uint32_t class_def_idx) {
 
     // Parse virtual methods
     if (virtual_methods_count > 0) {
-        if (virtual_methods_count > SIZE_MAX / sizeof(DxDexEncodedMethod)) goto fail_methods;
+        if (virtual_methods_count > 100000) goto fail_methods;  // 100K methods per class max
         cd->virtual_methods = (DxDexEncodedMethod *)dx_malloc(sizeof(DxDexEncodedMethod) * virtual_methods_count);
         if (!cd->virtual_methods) goto fail_methods;
         uint32_t method_idx = 0;

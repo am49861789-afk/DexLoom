@@ -99,6 +99,12 @@ private func argbColor(_ argb: UInt32) -> Color {
 
 // MARK: - Android View Renderer
 
+/// Threshold above which child rendering switches to LazyVStack/LazyHStack
+private let lazyChildThreshold = 20
+
+/// Threshold above which RecyclerView items use visible-only rendering
+private let recyclerViewLazyThreshold = 50
+
 struct AndroidViewRenderer: View {
     let node: RenderNode
     let bridge: RuntimeBridge
@@ -205,14 +211,10 @@ struct AndroidViewRenderer: View {
         switch node.type {
         case DX_VIEW_LINEAR_LAYOUT:
             if node.orientation == DX_ORIENTATION_VERTICAL {
-                VStack(alignment: .leading, spacing: 0) {
-                    childViews
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                lazyVerticalChildViews
+                    .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                HStack(alignment: .center, spacing: 0) {
-                    childViews
-                }
+                lazyHorizontalChildViews
             }
 
         case DX_VIEW_CONSTRAINT_LAYOUT:
@@ -274,8 +276,10 @@ struct AndroidViewRenderer: View {
         case DX_VIEW_LIST_VIEW, DX_VIEW_GRID_VIEW:
             // ListView / GridView — vertical list of adapter-provided children
             ScrollView {
-                VStack(alignment: .leading, spacing: 1) {
-                    childViews
+                LazyVStack(alignment: .leading, spacing: 1) {
+                    ForEach(node.children) { child in
+                        AndroidViewRenderer(node: child, bridge: bridge)
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -331,12 +335,22 @@ struct AndroidViewRenderer: View {
                     .shadow(color: .black.opacity(0.2), radius: 6, x: 0, y: 3)
             }
 
-        default:
-            // DX_VIEW_VIEW_GROUP, DX_VIEW_RECYCLER_VIEW, etc.
-            VStack(alignment: .leading, spacing: 0) {
-                childViews
+        case DX_VIEW_RECYCLER_VIEW:
+            // RecyclerView — use LazyVStack for view recycling
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(node.children) { child in
+                        AndroidViewRenderer(node: child, bridge: bridge)
+                            .id(child.id)
+                    }
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+
+        default:
+            // DX_VIEW_VIEW_GROUP, etc.
+            lazyVerticalChildViews
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -347,6 +361,40 @@ struct AndroidViewRenderer: View {
         ForEach(node.children) { child in
             if child.type.rawValue >= 0 {  // always true, just keeps ForEach happy
                 AndroidViewRenderer(node: child, bridge: bridge)
+            }
+        }
+    }
+
+    /// Lazy vertical child rendering for containers with many children.
+    /// Uses LazyVStack when child count exceeds lazyChildThreshold.
+    @ViewBuilder
+    private var lazyVerticalChildViews: some View {
+        if node.children.count > lazyChildThreshold {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(node.children) { child in
+                    AndroidViewRenderer(node: child, bridge: bridge)
+                }
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 0) {
+                childViews
+            }
+        }
+    }
+
+    /// Lazy horizontal child rendering for containers with many children.
+    /// Uses LazyHStack when child count exceeds lazyChildThreshold.
+    @ViewBuilder
+    private var lazyHorizontalChildViews: some View {
+        if node.children.count > lazyChildThreshold {
+            LazyHStack(alignment: .center, spacing: 0) {
+                ForEach(node.children) { child in
+                    AndroidViewRenderer(node: child, bridge: bridge)
+                }
+            }
+        } else {
+            HStack(alignment: .center, spacing: 0) {
+                childViews
             }
         }
     }
@@ -669,12 +717,18 @@ private struct AndroidStyleModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .applyLayoutSize(width: node.width, height: node.height, weight: node.weight)
+            .applyLayoutSize(width: node.width, height: node.height, weight: node.weight,
+                             measuredWidth: node.measuredWidth, measuredHeight: node.measuredHeight)
             .padding(.leading, dp(node.padding.0))
             .padding(.top, dp(node.padding.1))
             .padding(.trailing, dp(node.padding.2))
             .padding(.bottom, dp(node.padding.3))
             .background(shapeOrColorBackground)
+            .applyFocusBorder(node: node)
+            .opacity(Double(node.alpha))
+            .rotationEffect(.degrees(Double(node.rotation)))
+            .scaleEffect(x: CGFloat(node.scaleX), y: CGFloat(node.scaleY))
+            .offset(x: CGFloat(node.translationX), y: CGFloat(node.translationY))
             .padding(.leading, dp(node.margin.0))
             .padding(.top, dp(node.margin.1))
             .padding(.trailing, dp(node.margin.2))
@@ -769,6 +823,8 @@ private struct LayoutSizeModifier: ViewModifier {
     let width: Int32
     let height: Int32
     let weight: Float
+    let measuredWidth: Float
+    let measuredHeight: Float
 
     func body(content: Content) -> some View {
         content
@@ -779,37 +835,58 @@ private struct LayoutSizeModifier: ViewModifier {
     }
 
     // width: -1 match_parent -> maxWidth: .infinity
-    //        -2 wrap_content -> natural size (nil)
+    //        -2 wrap_content -> use measured size if available, else natural size (nil)
     //        >0 specific dp  -> fixed width (converted via dp())
     private var widthMin: CGFloat? {
         if width > 0 { return dp(width) }
+        if width == -2 && measuredWidth > 0 { return CGFloat(measuredWidth) }
         return nil
     }
     private var widthMax: CGFloat? {
         if width == -1 || weight > 0 { return .infinity }   // match_parent or weighted
         if width > 0 { return dp(width) }
+        if width == -2 && measuredWidth > 0 { return CGFloat(measuredWidth) }
         return nil  // wrap_content
     }
     private var heightMin: CGFloat? {
         if height > 0 { return dp(height) }
+        if height == -2 && measuredHeight > 0 { return CGFloat(measuredHeight) }
         return nil
     }
     private var heightMax: CGFloat? {
         if height == -1 { return .infinity }
         if height > 0 { return dp(height) }
+        if height == -2 && measuredHeight > 0 { return CGFloat(measuredHeight) }
         return nil  // wrap_content
     }
 }
 
 extension View {
-    fileprivate func applyLayoutSize(width: Int32, height: Int32, weight: Float) -> some View {
-        modifier(LayoutSizeModifier(width: width, height: height, weight: weight))
+    fileprivate func applyLayoutSize(width: Int32, height: Int32, weight: Float,
+                                     measuredWidth: Float, measuredHeight: Float) -> some View {
+        modifier(LayoutSizeModifier(width: width, height: height, weight: weight,
+                                    measuredWidth: measuredWidth, measuredHeight: measuredHeight))
     }
 }
 
 extension View {
     fileprivate func applyAndroidStyle(node: RenderNode) -> some View {
         modifier(AndroidStyleModifier(node: node))
+    }
+}
+
+extension View {
+    /// Applies a blue border to focused EditText views
+    @ViewBuilder
+    fileprivate func applyFocusBorder(node: RenderNode) -> some View {
+        if node.focused && node.type == DX_VIEW_EDIT_TEXT {
+            self.overlay(
+                RoundedRectangle(cornerRadius: 4)
+                    .stroke(Color.blue, lineWidth: 2)
+            )
+        } else {
+            self
+        }
     }
 }
 

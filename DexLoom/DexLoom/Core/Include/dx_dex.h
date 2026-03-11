@@ -159,6 +159,13 @@ typedef struct {
     bool parsed;                    // true if successfully parsed
 } DxCallSite;
 
+// Map item (from DEX map_list section)
+typedef struct {
+    uint16_t type;
+    uint32_t size;
+    uint32_t offset;
+} DxMapItem;
+
 // Complete parsed DEX file
 struct DxDexFile {
     const uint8_t  *raw_data;
@@ -166,8 +173,13 @@ struct DxDexFile {
 
     DxDexHeader     header;
 
+    // Map section
+    DxMapItem      *map_items;
+    uint32_t        map_item_count;
+
     // Tables (point into raw_data)
-    char          **strings;        // decoded string table
+    char          **strings;        // decoded string table (lazy: NULL until first access)
+    uint32_t       *string_data_offsets; // raw data offsets for lazy string decoding
     uint32_t        string_count;
 
     DxDexTypeId    *type_ids;

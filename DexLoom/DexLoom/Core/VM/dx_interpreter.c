@@ -16,6 +16,13 @@ static uint64_t dx_current_time_ms(void) {
     return ns / 1000000ULL;
 }
 
+// Nanoseconds using Mach absolute time (for profiling)
+static uint64_t dx_current_time_ns(void) {
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    return mach_absolute_time() * tb.numer / tb.denom;
+}
+
 #define TAG "Interp"
 
 // Computed goto (threaded dispatch) for interpreter speedup.
@@ -67,9 +74,9 @@ static int32_t interp_read_sleb128(const uint8_t **pp) {
 
 // DEX try_item structure (8 bytes each, after insns array)
 typedef struct {
-    uint32_t start_addr;   // start of try block (code unit offset)
-    uint16_t insn_count;   // length of try block (code units)
-    uint16_t handler_off;  // offset to encoded_catch_handler from handler list start
+    uint32_t start_addr;       // start of try block (code unit offset)
+    uint16_t try_insn_count;   // length of try block (code units)
+    uint16_t handler_off;      // offset to encoded_catch_handler from handler list start
 } DxTryItem;
 
 // Search try/catch handlers for a matching handler at the given pc.
@@ -272,6 +279,62 @@ static uint8_t pack_varargs(DxVM *vm, DxValue *args, uint8_t argc,
     return (uint8_t)(vararg_start + 1);
 }
 
+// Analyze a method to detect trivial getter/setter patterns for inlining.
+// Getter pattern: iget-* vA, vB, field@CCCC + return-* vA (2 instructions)
+// Setter pattern: iput-* vA, vB, field@CCCC + return-void (2 instructions)
+void dx_method_analyze_inline(DxMethod *method) {
+    if (method->analyzed_for_inline) return;
+    method->analyzed_for_inline = true;
+    method->inline_type = DX_INLINE_NONE;
+
+    // Only analyze DEX methods with code, not native
+    if (!method->has_code || method->is_native) return;
+    if (!method->code.insns) return;
+
+    // Must be exactly 2 code units (two 16-bit instructions) for getter
+    // or exactly 2 code units for setter
+    // iget family: 0x52-0x58 (22c, 2 code units each)
+    // iput family: 0x59-0x5F (22c, 2 code units each)
+    // return-void: 0x0E (10x, 1 code unit)
+    // return: 0x0F (11x, 1 code unit)
+    // return-wide: 0x10 (11x, 1 code unit)
+    // return-object: 0x11 (11x, 1 code unit)
+    // Getter = iget (2 units) + return (1 unit) = 3 code units total
+    // Setter = iput (2 units) + return-void (1 unit) = 3 code units total
+    uint32_t insns_size = method->code.insns_size;
+    if (insns_size != 3) return;
+
+    const uint16_t *insns = method->code.insns;
+    uint8_t op0 = insns[0] & 0xFF;
+    uint8_t op1 = insns[2] & 0xFF;
+
+    // Check for getter: iget-* (0x52-0x58) followed by return-*/return-object (0x0F-0x11)
+    if (op0 >= 0x52 && op0 <= 0x58) {
+        uint8_t dst = (insns[0] >> 8) & 0x0F;
+        uint16_t field_idx = insns[1];
+
+        if (op1 >= 0x0F && op1 <= 0x11) {
+            uint8_t ret_src = (insns[2] >> 8) & 0xFF;
+            if (ret_src == dst) {
+                method->inline_type = DX_INLINE_GETTER;
+                method->inline_field_idx = field_idx;
+                return;
+            }
+        }
+    }
+
+    // Check for setter: iput-* (0x59-0x5F) followed by return-void (0x0E)
+    if (op0 >= 0x59 && op0 <= 0x5F) {
+        uint16_t field_idx = insns[1];
+
+        if (op1 == 0x0E) {
+            method->inline_type = DX_INLINE_SETTER;
+            method->inline_field_idx = field_idx;
+            return;
+        }
+    }
+}
+
 // Resolve and execute an invoke instruction
 static DxResult handle_invoke(DxVM *vm, DxFrame *frame, const uint16_t *code,
                                 uint32_t pc, uint8_t opcode) {
@@ -296,14 +359,33 @@ static DxResult handle_invoke(DxVM *vm, DxFrame *frame, const uint16_t *code,
     }
 
     // For invoke-virtual, resolve actual target from receiver's vtable
+    // with inline cache optimization for monomorphic/polymorphic call sites
     if (opcode == 0x6E && argc > 0 && target->vtable_idx >= 0) {
         DxValue recv_val = frame->registers[arg_regs[0]];
         if (recv_val.tag == DX_VAL_OBJ && recv_val.obj) {
             DxObject *receiver = recv_val.obj;
-            if (receiver->klass &&
-                (uint32_t)target->vtable_idx < receiver->klass->vtable_size) {
-                DxMethod *vtable_target = receiver->klass->vtable[target->vtable_idx];
-                if (vtable_target) target = vtable_target;
+            if (receiver->klass) {
+                // Try inline cache first (keyed by caller method + PC)
+                DxMethod *ic_result = NULL;
+                DxInlineCache *ic = frame->method ? dx_vm_ic_get(frame->method, pc) : NULL;
+                if (ic) {
+                    ic_result = dx_vm_ic_lookup(ic, receiver->klass);
+                }
+
+                if (ic_result) {
+                    // IC hit — use cached method directly, skip vtable walk
+                    target = ic_result;
+                } else {
+                    // IC miss — do the full vtable lookup
+                    if ((uint32_t)target->vtable_idx < receiver->klass->vtable_size) {
+                        DxMethod *vtable_target = receiver->klass->vtable[target->vtable_idx];
+                        if (vtable_target) target = vtable_target;
+                    }
+                    // Insert into inline cache for next time
+                    if (ic) {
+                        dx_vm_ic_insert(ic, receiver->klass, target);
+                    }
+                }
             }
         }
     }
@@ -334,23 +416,29 @@ static DxResult handle_invoke(DxVM *vm, DxFrame *frame, const uint16_t *code,
     }
 
     // For invoke-super, resolve on the declaring class's super (Dalvik semantics)
+    // Walk up the entire superclass chain to find the method (grandparent etc.)
     if (opcode == 0x6F && argc > 0) {
         DxClass *declaring = target->declaring_class;
         DxMethod *original_target = target;
         bool super_found = false;
         if (declaring && declaring->super_class) {
-            DxMethod *super_method = dx_vm_find_method(declaring->super_class,
-                                                        target->name, target->shorty);
-            if (super_method && super_method != original_target) {
-                target = super_method;
-                super_found = true;
-            } else if (target->vtable_idx >= 0) {
-                // Fallback: try vtable lookup on receiver's super
+            // Walk up the superclass hierarchy to find the method
+            DxClass *walk = declaring->super_class;
+            while (walk && !super_found) {
+                DxMethod *super_method = dx_vm_find_method(walk, target->name, target->shorty);
+                if (super_method && super_method != original_target) {
+                    target = super_method;
+                    super_found = true;
+                }
+                walk = walk->super_class;
+            }
+            // Fallback: try vtable lookup on receiver's super chain
+            if (!super_found && target->vtable_idx >= 0) {
                 DxValue recv_val = frame->registers[arg_regs[0]];
                 if (recv_val.tag == DX_VAL_OBJ && recv_val.obj) {
                     DxObject *receiver = recv_val.obj;
-                    if (receiver->klass && receiver->klass->super_class) {
-                        DxClass *super = receiver->klass->super_class;
+                    DxClass *super = receiver->klass ? receiver->klass->super_class : NULL;
+                    while (super && !super_found) {
                         if ((uint32_t)target->vtable_idx < super->vtable_size) {
                             DxMethod *vtbl = super->vtable[target->vtable_idx];
                             if (vtbl && vtbl != original_target) {
@@ -358,15 +446,16 @@ static DxResult handle_invoke(DxVM *vm, DxFrame *frame, const uint16_t *code,
                                 super_found = true;
                             }
                         }
+                        super = super->super_class;
                     }
                 }
             }
         }
         // If super method not found or resolves to self, skip to avoid infinite recursion
         if (!super_found) {
-            DX_WARN(TAG, "invoke-super: no super for %s.%s - skipping",
-                    original_target->declaring_class ? original_target->declaring_class->descriptor : "?",
-                    original_target->name);
+            DX_WARN(TAG, "invoke-super: method %s not found in %s hierarchy",
+                    original_target->name,
+                    original_target->declaring_class ? original_target->declaring_class->descriptor : "?");
             frame->result = DX_NULL_VALUE;
             frame->has_result = true;
             return DX_OK;
@@ -462,6 +551,50 @@ static DxResult handle_invoke(DxVM *vm, DxFrame *frame, const uint16_t *code,
         }
     }
 
+    // Method inlining: skip frame creation for trivial getters/setters
+    if (!target->analyzed_for_inline) {
+        dx_method_analyze_inline(target);
+    }
+    if (target->inline_type == DX_INLINE_GETTER && argc >= 1) {
+        // Inline getter: iget field from receiver, return value directly
+        DxValue recv_val = call_args[0];
+        DxObject *obj = (recv_val.tag == DX_VAL_OBJ) ? recv_val.obj : NULL;
+        if (obj) {
+            DxDexFile *cur = (frame->method && frame->method->declaring_class &&
+                              frame->method->declaring_class->dex_file)
+                             ? frame->method->declaring_class->dex_file : vm->dex;
+            const char *fname = dx_dex_get_field_name(cur, target->inline_field_idx);
+            DxValue val;
+            if (fname && dx_vm_get_field(obj, fname, &val) == DX_OK) {
+                frame->result = val;
+            } else {
+                frame->result = DX_NULL_VALUE;
+            }
+        } else {
+            frame->result = DX_NULL_VALUE;
+        }
+        frame->has_result = true;
+        return DX_OK;
+    }
+    if (target->inline_type == DX_INLINE_SETTER && argc >= 2) {
+        // Inline setter: iput value into receiver field, return void
+        // args[0] = this (receiver object), args[1] = value to store
+        DxValue recv_val = call_args[0];
+        DxObject *obj = (recv_val.tag == DX_VAL_OBJ) ? recv_val.obj : NULL;
+        if (obj) {
+            DxDexFile *cur = (frame->method && frame->method->declaring_class &&
+                              frame->method->declaring_class->dex_file)
+                             ? frame->method->declaring_class->dex_file : vm->dex;
+            const char *fname = dx_dex_get_field_name(cur, target->inline_field_idx);
+            if (fname) {
+                dx_vm_set_field(obj, fname, call_args[1]);
+            }
+        }
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
     DxValue call_result;
     memset(&call_result, 0, sizeof(call_result));
     DxResult res = dx_vm_execute_method(vm, target, call_args, argc, &call_result);
@@ -531,14 +664,33 @@ static DxResult handle_invoke_range(DxVM *vm, DxFrame *frame, const uint16_t *co
     }
 
     // vtable dispatch for invoke-virtual/range
+    // with inline cache optimization for monomorphic/polymorphic call sites
     if (opcode == 0x74 && argc > 0 && target->vtable_idx >= 0) {
         DxValue recv_val = frame->registers[first_reg];
         if (recv_val.tag == DX_VAL_OBJ && recv_val.obj) {
             DxObject *receiver = recv_val.obj;
-            if (receiver->klass &&
-                (uint32_t)target->vtable_idx < receiver->klass->vtable_size) {
-                DxMethod *vt = receiver->klass->vtable[target->vtable_idx];
-                if (vt) target = vt;
+            if (receiver->klass) {
+                // Try inline cache first
+                DxMethod *ic_result = NULL;
+                DxInlineCache *ic = frame->method ? dx_vm_ic_get(frame->method, pc) : NULL;
+                if (ic) {
+                    ic_result = dx_vm_ic_lookup(ic, receiver->klass);
+                }
+
+                if (ic_result) {
+                    // IC hit — skip vtable walk
+                    target = ic_result;
+                } else {
+                    // IC miss — full vtable lookup
+                    if ((uint32_t)target->vtable_idx < receiver->klass->vtable_size) {
+                        DxMethod *vt = receiver->klass->vtable[target->vtable_idx];
+                        if (vt) target = vt;
+                    }
+                    // Update inline cache
+                    if (ic) {
+                        dx_vm_ic_insert(ic, receiver->klass, target);
+                    }
+                }
             }
         }
     }
@@ -565,22 +717,29 @@ static DxResult handle_invoke_range(DxVM *vm, DxFrame *frame, const uint16_t *co
     }
 
     // invoke-super/range: resolve on declaring class's superclass (Dalvik semantics)
+    // Walk up the entire superclass chain to find the method (grandparent etc.)
     if (opcode == 0x75 && argc > 0) {
         DxClass *declaring = target->declaring_class;
         DxMethod *original_target = target;
         bool super_found = false;
         if (declaring && declaring->super_class) {
-            DxMethod *super_method = dx_vm_find_method(declaring->super_class,
-                                                        target->name, target->shorty);
-            if (super_method && super_method != original_target) {
-                target = super_method;
-                super_found = true;
-            } else if (target->vtable_idx >= 0) {
+            // Walk up the superclass hierarchy
+            DxClass *walk = declaring->super_class;
+            while (walk && !super_found) {
+                DxMethod *super_method = dx_vm_find_method(walk, target->name, target->shorty);
+                if (super_method && super_method != original_target) {
+                    target = super_method;
+                    super_found = true;
+                }
+                walk = walk->super_class;
+            }
+            // Fallback: try vtable lookup on receiver's super chain
+            if (!super_found && target->vtable_idx >= 0) {
                 DxValue recv_val = frame->registers[first_reg];
                 if (recv_val.tag == DX_VAL_OBJ && recv_val.obj) {
                     DxObject *receiver = recv_val.obj;
-                    if (receiver->klass && receiver->klass->super_class) {
-                        DxClass *super = receiver->klass->super_class;
+                    DxClass *super = receiver->klass ? receiver->klass->super_class : NULL;
+                    while (super && !super_found) {
                         if ((uint32_t)target->vtable_idx < super->vtable_size) {
                             DxMethod *vtbl = super->vtable[target->vtable_idx];
                             if (vtbl && vtbl != original_target) {
@@ -588,14 +747,15 @@ static DxResult handle_invoke_range(DxVM *vm, DxFrame *frame, const uint16_t *co
                                 super_found = true;
                             }
                         }
+                        super = super->super_class;
                     }
                 }
             }
         }
         if (!super_found) {
-            DX_WARN(TAG, "invoke-super/range: no super for %s.%s - skipping",
-                    original_target->declaring_class ? original_target->declaring_class->descriptor : "?",
-                    original_target->name);
+            DX_WARN(TAG, "invoke-super/range: method %s not found in %s hierarchy",
+                    original_target->name,
+                    original_target->declaring_class ? original_target->declaring_class->descriptor : "?");
             frame->result = DX_NULL_VALUE;
             frame->has_result = true;
             return DX_OK;
@@ -683,6 +843,47 @@ static DxResult handle_invoke_range(DxVM *vm, DxFrame *frame, const uint16_t *co
             frame->has_result = true;
             return DX_OK;
         }
+    }
+
+    // Method inlining: skip frame creation for trivial getters/setters
+    if (!target->analyzed_for_inline) {
+        dx_method_analyze_inline(target);
+    }
+    if (target->inline_type == DX_INLINE_GETTER && clamped_argc >= 1) {
+        DxValue recv_val = call_args[0];
+        DxObject *obj = (recv_val.tag == DX_VAL_OBJ) ? recv_val.obj : NULL;
+        if (obj) {
+            DxDexFile *cur = (frame->method && frame->method->declaring_class &&
+                              frame->method->declaring_class->dex_file)
+                             ? frame->method->declaring_class->dex_file : vm->dex;
+            const char *fname = dx_dex_get_field_name(cur, target->inline_field_idx);
+            DxValue val;
+            if (fname && dx_vm_get_field(obj, fname, &val) == DX_OK) {
+                frame->result = val;
+            } else {
+                frame->result = DX_NULL_VALUE;
+            }
+        } else {
+            frame->result = DX_NULL_VALUE;
+        }
+        frame->has_result = true;
+        return DX_OK;
+    }
+    if (target->inline_type == DX_INLINE_SETTER && clamped_argc >= 2) {
+        DxValue recv_val = call_args[0];
+        DxObject *obj = (recv_val.tag == DX_VAL_OBJ) ? recv_val.obj : NULL;
+        if (obj) {
+            DxDexFile *cur = (frame->method && frame->method->declaring_class &&
+                              frame->method->declaring_class->dex_file)
+                             ? frame->method->declaring_class->dex_file : vm->dex;
+            const char *fname = dx_dex_get_field_name(cur, target->inline_field_idx);
+            if (fname) {
+                dx_vm_set_field(obj, fname, call_args[1]);
+            }
+        }
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
     }
 
     DxValue call_result;
@@ -830,6 +1031,12 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         vm->watchdog_triggered = false;
     }
 
+    // Profiling: record method entry time
+    uint64_t _prof_start_ns = 0;
+    if (vm->profiling_enabled) {
+        _prof_start_ns = dx_current_time_ns();
+    }
+
     // Debug tracing: method entry
     const char *_trace_cls = method->declaring_class ? method->declaring_class->descriptor : "?";
     const char *_trace_mth = method->name ? method->name : "?";
@@ -854,6 +1061,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         DX_ERROR(TAG, "Stack overflow at %s.%s (depth %u)",
                  method->declaring_class ? method->declaring_class->descriptor : "?",
                  method->name, vm->stack_depth);
+        if (_trace_method_active) vm->debug.trace_depth--;
         return DX_ERR_STACK_OVERFLOW;
     }
 
@@ -959,6 +1167,17 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
     uint32_t code_size = method->code.insns_size;
     uint32_t pc = 0;
     DxDexFile *cur_dex = get_current_dex(vm);
+
+    // Register file pinning: keep frequently dereferenced pointers in locals
+    // to avoid repeated indirection through frame-> and method-> on every opcode.
+    // The compiler may already do this, but explicit pinning ensures it across
+    // all optimization levels and prevents re-loads after calls that may alias.
+    DxValue *pinned_regs = frame->registers;
+    const uint16_t *pinned_code = code;
+    uint32_t pinned_code_size = code_size;
+    // Suppress unused warnings — pinned_code/pinned_code_size mirror code/code_size
+    (void)pinned_code;
+    (void)pinned_code_size;
 
     DxResult exec_result = DX_OK;
     uint32_t null_access_count = 0;  // total iget/iput on null counter (not reset)
@@ -1265,6 +1484,11 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         insn_trace[insn_trace_idx % INSN_TRACE_SIZE].opcode = code[pc] & 0xFF;
         insn_trace_idx++;
 
+        // Profiling: opcode frequency histogram
+        if (vm->profiling_enabled) {
+            vm->opcode_histogram[code[pc] & 0xFF]++;
+        }
+
         // Watchdog: check wall-clock timeout every 10000 instructions
         if (vm->watchdog_timeout_ms > 0 && (vm->insn_count % 10000) == 0) {
             uint64_t now_ms = dx_current_time_ms();
@@ -1323,9 +1547,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         if (vm->debug.bytecode_trace && _trace_method_active) {
             DX_INFO("Trace", "  [PC=%04x] op=%02x (%s) regs: v0=%lld v1=%lld v2=%lld",
                     pc, opcode, dx_opcode_name(opcode),
-                    (long long)frame->registers[0].l,
-                    (long long)(regs > 1 ? frame->registers[1].l : 0),
-                    (long long)(regs > 2 ? frame->registers[2].l : 0));
+                    (long long)pinned_regs[0].l,
+                    (long long)(regs > 1 ? pinned_regs[1].l : 0),
+                    (long long)(regs > 2 ? pinned_regs[2].l : 0));
         }
 
 #if USE_COMPUTED_GOTO
@@ -1350,7 +1574,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             CHECK_REG(dst); CHECK_REG(src);
-            frame->registers[dst] = frame->registers[src];
+            pinned_regs[dst] = pinned_regs[src];
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -1363,7 +1587,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t dst = (inst >> 8) & 0xFF;
             uint16_t src = code[pc + 1];
             if (src < DX_MAX_REGISTERS)
-                frame->registers[dst] = frame->registers[src];
+                pinned_regs[dst] = pinned_regs[src];
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -1376,7 +1600,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint16_t dst = code[pc + 1];
             uint16_t src = code[pc + 2];
             if (dst < DX_MAX_REGISTERS && src < DX_MAX_REGISTERS)
-                frame->registers[dst] = frame->registers[src];
+                pinned_regs[dst] = pinned_regs[src];
             pc += 3;
             DISPATCH_NEXT;
         }
@@ -1388,9 +1612,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst] = frame->registers[src];
+            pinned_regs[dst] = pinned_regs[src];
             if (dst + 1 < DX_MAX_REGISTERS && src + 1 < DX_MAX_REGISTERS)
-                frame->registers[dst + 1] = frame->registers[src + 1];
+                pinned_regs[dst + 1] = pinned_regs[src + 1];
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -1403,9 +1627,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t dst = (inst >> 8) & 0xFF;
             uint16_t src = code[pc + 1];
             if (src < DX_MAX_REGISTERS) {
-                frame->registers[dst] = frame->registers[src];
+                pinned_regs[dst] = pinned_regs[src];
                 if (dst + 1 < DX_MAX_REGISTERS && src + 1 < DX_MAX_REGISTERS)
-                    frame->registers[dst + 1] = frame->registers[src + 1];
+                    pinned_regs[dst + 1] = pinned_regs[src + 1];
             }
             pc += 2;
             DISPATCH_NEXT;
@@ -1419,9 +1643,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint16_t dst = code[pc + 1];
             uint16_t src = code[pc + 2];
             if (dst < DX_MAX_REGISTERS && src < DX_MAX_REGISTERS) {
-                frame->registers[dst] = frame->registers[src];
+                pinned_regs[dst] = pinned_regs[src];
                 if (dst + 1 < DX_MAX_REGISTERS && src + 1 < DX_MAX_REGISTERS)
-                    frame->registers[dst + 1] = frame->registers[src + 1];
+                    pinned_regs[dst + 1] = pinned_regs[src + 1];
             }
             pc += 3;
             DISPATCH_NEXT;
@@ -1435,7 +1659,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             CHECK_REG(dst); CHECK_REG(src);
-            frame->registers[dst] = frame->registers[src];
+            pinned_regs[dst] = pinned_regs[src];
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -1448,7 +1672,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t dst = (inst >> 8) & 0xFF;
             uint16_t src = code[pc + 1];
             if (src < DX_MAX_REGISTERS)
-                frame->registers[dst] = frame->registers[src];
+                pinned_regs[dst] = pinned_regs[src];
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -1461,7 +1685,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint16_t dst = code[pc + 1];
             uint16_t src = code[pc + 2];
             if (dst < DX_MAX_REGISTERS && src < DX_MAX_REGISTERS)
-                frame->registers[dst] = frame->registers[src];
+                pinned_regs[dst] = pinned_regs[src];
             pc += 3;
             DISPATCH_NEXT;
         }
@@ -1472,7 +1696,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         case 0x0A: { // move-result vAA (11x)
 #endif
             uint8_t dst = (inst >> 8) & 0xFF;
-            frame->registers[dst] = frame->result;
+            pinned_regs[dst] = frame->result;
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -1483,7 +1707,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         case 0x0B: { // move-result-wide vAA (11x)
 #endif
             uint8_t dst = (inst >> 8) & 0xFF;
-            frame->registers[dst] = frame->result;
+            pinned_regs[dst] = frame->result;
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -1494,7 +1718,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         case 0x0C: { // move-result-object vAA (11x)
 #endif
             uint8_t dst = (inst >> 8) & 0xFF;
-            frame->registers[dst] = frame->result;
+            pinned_regs[dst] = frame->result;
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -1506,10 +1730,10 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0xFF;
             if (frame->exception) {
-                frame->registers[dst] = DX_OBJ_VALUE(frame->exception);
+                pinned_regs[dst] = DX_OBJ_VALUE(frame->exception);
                 frame->exception = NULL;  // clear after retrieval
             } else {
-                frame->registers[dst] = DX_NULL_VALUE;
+                pinned_regs[dst] = DX_NULL_VALUE;
             }
             pc += 1;
             DISPATCH_NEXT;
@@ -1540,9 +1764,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         case 0x0F: { // return vAA
 #endif
             uint8_t src = (inst >> 8) & 0xFF;
-            frame->result = frame->registers[src];
+            frame->result = pinned_regs[src];
             frame->has_result = true;
-            if (result) *result = frame->registers[src];
+            if (result) *result = pinned_regs[src];
             // Check for finally blocks covering this return
             if (method->code.tries_size > 0) {
                 uint32_t finally_addr = find_finally_handler(code, code_size,
@@ -1563,9 +1787,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         case 0x10: { // return-wide vAA
 #endif
             uint8_t src = (inst >> 8) & 0xFF;
-            frame->result = frame->registers[src];
+            frame->result = pinned_regs[src];
             frame->has_result = true;
-            if (result) *result = frame->registers[src];
+            if (result) *result = pinned_regs[src];
             if (method->code.tries_size > 0) {
                 uint32_t finally_addr = find_finally_handler(code, code_size,
                                                               method->code.tries_size, pc);
@@ -1585,9 +1809,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         case 0x11: { // return-object vAA
 #endif
             uint8_t src = (inst >> 8) & 0xFF;
-            frame->result = frame->registers[src];
+            frame->result = pinned_regs[src];
             frame->has_result = true;
-            if (result) *result = frame->registers[src];
+            if (result) *result = pinned_regs[src];
             if (method->code.tries_size > 0) {
                 uint32_t finally_addr = find_finally_handler(code, code_size,
                                                               method->code.tries_size, pc);
@@ -1609,7 +1833,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t dst = (inst >> 8) & 0x0F;
             int32_t val = (int32_t)(inst >> 12);
             if (val & 0x8) val |= (int32_t)0xFFFFFFF0;
-            frame->registers[dst] = DX_INT_VALUE(val);
+            pinned_regs[dst] = DX_INT_VALUE(val);
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -1621,7 +1845,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0xFF;
             int16_t val = (int16_t)code[pc + 1];
-            frame->registers[dst] = DX_INT_VALUE((int32_t)val);
+            pinned_regs[dst] = DX_INT_VALUE((int32_t)val);
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -1633,7 +1857,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0xFF;
             int32_t val = (int32_t)(code[pc + 1] | ((uint32_t)code[pc + 2] << 16));
-            frame->registers[dst] = DX_INT_VALUE(val);
+            pinned_regs[dst] = DX_INT_VALUE(val);
             pc += 3;
             DISPATCH_NEXT;
         }
@@ -1645,7 +1869,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0xFF;
             int32_t val = (int32_t)((uint32_t)code[pc + 1] << 16);
-            frame->registers[dst] = DX_INT_VALUE(val);
+            pinned_regs[dst] = DX_INT_VALUE(val);
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -1657,8 +1881,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0xFF;
             int64_t val = (int16_t)code[pc + 1];
-            frame->registers[dst].tag = DX_VAL_LONG;
-            frame->registers[dst].l = val;
+            pinned_regs[dst].tag = DX_VAL_LONG;
+            pinned_regs[dst].l = val;
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -1670,8 +1894,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0xFF;
             int32_t val = (int32_t)(code[pc + 1] | ((uint32_t)code[pc + 2] << 16));
-            frame->registers[dst].tag = DX_VAL_LONG;
-            frame->registers[dst].l = (int64_t)val;
+            pinned_regs[dst].tag = DX_VAL_LONG;
+            pinned_regs[dst].l = (int64_t)val;
             pc += 3;
             DISPATCH_NEXT;
         }
@@ -1686,8 +1910,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                           ((int64_t)code[pc + 2] << 16) |
                           ((int64_t)code[pc + 3] << 32) |
                           ((int64_t)code[pc + 4] << 48);
-            frame->registers[dst].tag = DX_VAL_LONG;
-            frame->registers[dst].l = val;
+            pinned_regs[dst].tag = DX_VAL_LONG;
+            pinned_regs[dst].l = val;
             pc += 5;
             DISPATCH_NEXT;
         }
@@ -1699,8 +1923,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0xFF;
             int64_t val = (int64_t)((uint64_t)code[pc + 1] << 48);
-            frame->registers[dst].tag = DX_VAL_LONG;
-            frame->registers[dst].l = val;
+            pinned_regs[dst].tag = DX_VAL_LONG;
+            pinned_regs[dst].l = val;
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -1714,7 +1938,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint16_t str_idx = code[pc + 1];
             const char *str = dx_dex_get_string(cur_dex, str_idx);
             DxObject *str_obj = dx_vm_create_string(vm, str ? str : "");
-            frame->registers[dst] = DX_OBJ_VALUE(str_obj);
+            pinned_regs[dst] = DX_OBJ_VALUE(str_obj);
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -1728,7 +1952,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint32_t str_idx = code[pc + 1] | ((uint32_t)code[pc + 2] << 16);
             const char *str = dx_dex_get_string(cur_dex, str_idx);
             DxObject *str_obj = dx_vm_create_string(vm, str ? str : "");
-            frame->registers[dst] = DX_OBJ_VALUE(str_obj);
+            pinned_regs[dst] = DX_OBJ_VALUE(str_obj);
             pc += 3;
             DISPATCH_NEXT;
         }
@@ -1740,18 +1964,34 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0xFF;
             // Return null for class objects - proper Class<T> not modeled
-            frame->registers[dst] = DX_NULL_VALUE;
+            pinned_regs[dst] = DX_NULL_VALUE;
             pc += 2;
             DISPATCH_NEXT;
         }
 
 #if USE_COMPUTED_GOTO
-        op_0x1D: // monitor-enter (11x) - no threading model
+        op_0x1D: // monitor-enter (11x) - no threading model, with spin detection
 #else
-        case 0x1D: // monitor-enter (11x) - no threading model
+        case 0x1D: // monitor-enter (11x) - no threading model, with spin detection
 #endif
+        {
+            // Detect potential deadlock: same monitor-enter PC hit repeatedly
+            static uint32_t monitor_last_pc = UINT32_MAX;
+            static uint32_t monitor_spin_count = 0;
+            if (pc == monitor_last_pc) {
+                monitor_spin_count++;
+                if (monitor_spin_count > 10000) {
+                    DX_WARN(TAG, "Potential deadlock: monitor-enter at PC %u hit %u times without progress",
+                            pc, monitor_spin_count);
+                    monitor_spin_count = 0; // reset so we don't spam
+                }
+            } else {
+                monitor_last_pc = pc;
+                monitor_spin_count = 1;
+            }
             pc += 1;
             DISPATCH_NEXT;
+        }
 
 #if USE_COMPUTED_GOTO
         op_0x1E: // monitor-exit (11x) - no threading model
@@ -1768,7 +2008,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t src = (inst >> 8) & 0xFF;
             uint16_t type_idx = code[pc + 1];
-            DxObject *obj = (frame->registers[src].tag == DX_VAL_OBJ) ? frame->registers[src].obj : NULL;
+            DxObject *obj = (pinned_regs[src].tag == DX_VAL_OBJ) ? pinned_regs[src].obj : NULL;
             if (obj) {
                 const char *type_desc = dx_dex_get_type(cur_dex, type_idx);
                 DxClass *cls = obj->klass;
@@ -1823,10 +2063,10 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t obj_reg = (inst >> 12) & 0x0F;
             uint16_t type_idx = code[pc + 1];
 
-            DxObject *obj = (frame->registers[obj_reg].tag == DX_VAL_OBJ)
-                            ? frame->registers[obj_reg].obj : NULL;
+            DxObject *obj = (pinned_regs[obj_reg].tag == DX_VAL_OBJ)
+                            ? pinned_regs[obj_reg].obj : NULL;
             if (!obj) {
-                frame->registers[dst] = DX_INT_VALUE(0);
+                pinned_regs[dst] = DX_INT_VALUE(0);
             } else {
                 const char *type_desc = dx_dex_get_type(cur_dex, type_idx);
                 // Walk class hierarchy to check class and interfaces
@@ -1846,7 +2086,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                     }
                     cls = cls->super_class;
                 }
-                frame->registers[dst] = DX_INT_VALUE(match ? 1 : 0);
+                pinned_regs[dst] = DX_INT_VALUE(match ? 1 : 0);
             }
             pc += 2;
             DISPATCH_NEXT;
@@ -1859,11 +2099,11 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            DxObject *arr = frame->registers[src].obj;
+            DxObject *arr = pinned_regs[src].obj;
             if (arr && arr->is_array) {
-                frame->registers[dst] = DX_INT_VALUE((int32_t)arr->array_length);
+                pinned_regs[dst] = DX_INT_VALUE((int32_t)arr->array_length);
             } else {
-                frame->registers[dst] = DX_INT_VALUE(0);
+                pinned_regs[dst] = DX_INT_VALUE(0);
             }
             pc += 1;
             DISPATCH_NEXT;
@@ -1892,7 +2132,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             DxObject *obj = dx_vm_alloc_object(vm, cls);
             if (!obj) { exec_result = DX_ERR_OUT_OF_MEMORY; goto done; }
 
-            frame->registers[dst] = DX_OBJ_VALUE(obj);
+            pinned_regs[dst] = DX_OBJ_VALUE(obj);
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -1904,13 +2144,13 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t size_reg = (inst >> 12) & 0x0F;
-            int32_t length = frame->registers[size_reg].i;
+            int32_t length = pinned_regs[size_reg].i;
             if (length < 0) length = 0;
             DxObject *arr = dx_vm_alloc_array(vm, (uint32_t)length);
             if (arr) {
-                frame->registers[dst] = DX_OBJ_VALUE(arr);
+                pinned_regs[dst] = DX_OBJ_VALUE(arr);
             } else {
-                frame->registers[dst] = DX_NULL_VALUE;
+                pinned_regs[dst] = DX_NULL_VALUE;
             }
             pc += 2;
             DISPATCH_NEXT;
@@ -1927,7 +2167,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             DxObject *arr = dx_vm_alloc_array(vm, argc);
             if (arr) {
                 for (uint8_t i = 0; i < argc; i++) {
-                    arr->array_elements[i] = frame->registers[arg_regs[i]];
+                    arr->array_elements[i] = pinned_regs[arg_regs[i]];
                 }
                 frame->result = DX_OBJ_VALUE(arr);
             } else {
@@ -1950,7 +2190,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 for (uint8_t i = 0; i < argc; i++) {
                     uint16_t reg = first_reg + i;
                     if (reg < DX_MAX_REGISTERS) {
-                        arr->array_elements[i] = frame->registers[reg];
+                        arr->array_elements[i] = pinned_regs[reg];
                     }
                 }
                 frame->result = DX_OBJ_VALUE(arr);
@@ -1980,7 +2220,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint32_t size = (uint32_t)payload[2] | ((uint32_t)payload[3] << 16);
             const uint8_t *data = (const uint8_t *)&payload[4];
 
-            DxObject *arr = frame->registers[arr_reg].obj;
+            DxObject *arr = pinned_regs[arr_reg].obj;
             if (arr && arr->is_array && arr->array_elements) {
                 uint32_t count = size < arr->array_length ? size : arr->array_length;
                 for (uint32_t i = 0; i < count; i++) {
@@ -2016,7 +2256,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         case 0x27: { // throw vAA (11x)
 #endif
             uint8_t src = (inst >> 8) & 0xFF;
-            DxObject *exc = (frame->registers[src].tag == DX_VAL_OBJ) ? frame->registers[src].obj : NULL;
+            DxObject *exc = (pinned_regs[src].tag == DX_VAL_OBJ) ? pinned_regs[src].obj : NULL;
             const char *exc_class = exc && exc->klass ? exc->klass->descriptor : "unknown";
 
             // Search for a try/catch handler covering this pc
@@ -2091,7 +2331,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             int32_t first_key = (int32_t)(payload[2] | ((uint32_t)payload[3] << 16));
             const int32_t *targets = (const int32_t *)&payload[4];
 
-            int32_t test_val = frame->registers[test_reg].i;
+            int32_t test_val = pinned_regs[test_reg].i;
             int32_t idx = test_val - first_key;
             if (idx >= 0 && (uint32_t)idx < size) {
                 pc += targets[idx];
@@ -2125,7 +2365,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             const int32_t *keys = (const int32_t *)&payload[2];
             const int32_t *targets = (const int32_t *)&payload[2 + size * 2]; // after keys array
 
-            int32_t test_val = frame->registers[test_reg].i;
+            int32_t test_val = pinned_regs[test_reg].i;
             bool found = false;
             for (uint16_t si = 0; si < size; si++) {
                 if (keys[si] == test_val) {
@@ -2149,9 +2389,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t dst = (inst >> 8) & 0xFF;
             uint8_t b = code[pc + 1] & 0xFF;
             uint8_t c = (code[pc + 1] >> 8) & 0xFF;
-            float fb = frame->registers[b].f;
-            float fc = frame->registers[c].f;
-            frame->registers[dst] = DX_INT_VALUE(fb < fc ? -1 : (fb > fc ? 1 : 0));
+            float fb = pinned_regs[b].f;
+            float fc = pinned_regs[c].f;
+            pinned_regs[dst] = DX_INT_VALUE(fb < fc ? -1 : (fb > fc ? 1 : 0));
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -2163,9 +2403,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t dst = (inst >> 8) & 0xFF;
             uint8_t b = code[pc + 1] & 0xFF;
             uint8_t c = (code[pc + 1] >> 8) & 0xFF;
-            float fb = frame->registers[b].f;
-            float fc = frame->registers[c].f;
-            frame->registers[dst] = DX_INT_VALUE(fb > fc ? 1 : (fb < fc ? -1 : 0));
+            float fb = pinned_regs[b].f;
+            float fc = pinned_regs[c].f;
+            pinned_regs[dst] = DX_INT_VALUE(fb > fc ? 1 : (fb < fc ? -1 : 0));
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -2177,9 +2417,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t dst = (inst >> 8) & 0xFF;
             uint8_t b = code[pc + 1] & 0xFF;
             uint8_t c = (code[pc + 1] >> 8) & 0xFF;
-            double db = frame->registers[b].d;
-            double dc = frame->registers[c].d;
-            frame->registers[dst] = DX_INT_VALUE(db < dc ? -1 : (db > dc ? 1 : 0));
+            double db = pinned_regs[b].d;
+            double dc = pinned_regs[c].d;
+            pinned_regs[dst] = DX_INT_VALUE(db < dc ? -1 : (db > dc ? 1 : 0));
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -2191,9 +2431,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t dst = (inst >> 8) & 0xFF;
             uint8_t b = code[pc + 1] & 0xFF;
             uint8_t c = (code[pc + 1] >> 8) & 0xFF;
-            double db = frame->registers[b].d;
-            double dc = frame->registers[c].d;
-            frame->registers[dst] = DX_INT_VALUE(db > dc ? 1 : (db < dc ? -1 : 0));
+            double db = pinned_regs[b].d;
+            double dc = pinned_regs[c].d;
+            pinned_regs[dst] = DX_INT_VALUE(db > dc ? 1 : (db < dc ? -1 : 0));
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -2205,9 +2445,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t dst = (inst >> 8) & 0xFF;
             uint8_t b = code[pc + 1] & 0xFF;
             uint8_t c = (code[pc + 1] >> 8) & 0xFF;
-            int64_t lb = frame->registers[b].l;
-            int64_t lc = frame->registers[c].l;
-            frame->registers[dst] = DX_INT_VALUE(lb < lc ? -1 : (lb > lc ? 1 : 0));
+            int64_t lb = pinned_regs[b].l;
+            int64_t lc = pinned_regs[c].l;
+            pinned_regs[dst] = DX_INT_VALUE(lb < lc ? -1 : (lb > lc ? 1 : 0));
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -2226,8 +2466,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t a = (inst >> 8) & 0x0F;
             uint8_t b = (inst >> 12) & 0x0F;
             int16_t offset = (int16_t)code[pc + 1];
-            int32_t va = frame->registers[a].i;
-            int32_t vb = frame->registers[b].i;
+            int32_t va = pinned_regs[a].i;
+            int32_t vb = pinned_regs[b].i;
             bool take = false;
             switch (opcode) {
                 case 0x32: take = (va == vb); break; // if-eq
@@ -2255,10 +2495,10 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t src = (inst >> 8) & 0xFF;
             int16_t offset = (int16_t)code[pc + 1];
             int32_t val;
-            if (frame->registers[src].tag == DX_VAL_OBJ) {
-                val = (frame->registers[src].obj == NULL) ? 0 : 1;
+            if (pinned_regs[src].tag == DX_VAL_OBJ) {
+                val = (pinned_regs[src].obj == NULL) ? 0 : 1;
             } else {
-                val = frame->registers[src].i;
+                val = pinned_regs[src].i;
             }
             bool take = false;
             switch (opcode) {
@@ -2293,8 +2533,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t arr_reg = code[pc + 1] & 0xFF;
             uint8_t idx_reg = (code[pc + 1] >> 8) & 0xFF;
             CHECK_REG(dst); CHECK_REG(arr_reg); CHECK_REG(idx_reg);
-            DxObject *arr = (frame->registers[arr_reg].tag == DX_VAL_OBJ) ? frame->registers[arr_reg].obj : NULL;
-            int32_t index = frame->registers[idx_reg].i;
+            DxObject *arr = (pinned_regs[arr_reg].tag == DX_VAL_OBJ) ? pinned_regs[arr_reg].obj : NULL;
+            int32_t index = pinned_regs[idx_reg].i;
             if (!arr) {
                 // NullPointerException on null array
                 DxObject *exc = dx_vm_create_exception(vm, "Ljava/lang/NullPointerException;",
@@ -2305,9 +2545,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                     if (handler != UINT32_MAX) { pc = handler; goto next_instruction; }
                 }
                 if (exc) { vm->pending_exception = exc; exec_result = DX_ERR_EXCEPTION; goto done; }
-                frame->registers[dst] = (opcode == 0x46) ? DX_NULL_VALUE : DX_INT_VALUE(0);
+                pinned_regs[dst] = (opcode == 0x46) ? DX_NULL_VALUE : DX_INT_VALUE(0);
             } else if (arr->is_array && index >= 0 && (uint32_t)index < arr->array_length) {
-                frame->registers[dst] = arr->array_elements[index];
+                pinned_regs[dst] = arr->array_elements[index];
             } else if (arr->is_array) {
                 // ArrayIndexOutOfBoundsException
                 char msg[64];
@@ -2320,9 +2560,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                     if (handler != UINT32_MAX) { pc = handler; goto next_instruction; }
                 }
                 if (exc) { vm->pending_exception = exc; exec_result = DX_ERR_EXCEPTION; goto done; }
-                frame->registers[dst] = (opcode == 0x46) ? DX_NULL_VALUE : DX_INT_VALUE(0);
+                pinned_regs[dst] = (opcode == 0x46) ? DX_NULL_VALUE : DX_INT_VALUE(0);
             } else {
-                frame->registers[dst] = (opcode == 0x46) ? DX_NULL_VALUE : DX_INT_VALUE(0);
+                pinned_regs[dst] = (opcode == 0x46) ? DX_NULL_VALUE : DX_INT_VALUE(0);
             }
             pc += 2;
             DISPATCH_NEXT;
@@ -2347,8 +2587,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t arr_reg = code[pc + 1] & 0xFF;
             uint8_t idx_reg = (code[pc + 1] >> 8) & 0xFF;
             CHECK_REG(src); CHECK_REG(arr_reg); CHECK_REG(idx_reg);
-            DxObject *arr = (frame->registers[arr_reg].tag == DX_VAL_OBJ) ? frame->registers[arr_reg].obj : NULL;
-            int32_t index = frame->registers[idx_reg].i;
+            DxObject *arr = (pinned_regs[arr_reg].tag == DX_VAL_OBJ) ? pinned_regs[arr_reg].obj : NULL;
+            int32_t index = pinned_regs[idx_reg].i;
             if (!arr) {
                 DxObject *exc = dx_vm_create_exception(vm, "Ljava/lang/NullPointerException;",
                     "Attempt to store to null array");
@@ -2359,7 +2599,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 }
                 if (exc) { vm->pending_exception = exc; exec_result = DX_ERR_EXCEPTION; goto done; }
             } else if (arr->is_array && index >= 0 && (uint32_t)index < arr->array_length) {
-                arr->array_elements[index] = frame->registers[src];
+                arr->array_elements[index] = pinned_regs[src];
             } else if (arr->is_array) {
                 char msg[64];
                 snprintf(msg, sizeof(msg), "length=%u; index=%d", arr->array_length, index);
@@ -2397,7 +2637,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint16_t field_idx = code[pc + 1];
             CHECK_REG(dst); CHECK_REG(obj_reg);
 
-            DxValue obj_val = frame->registers[obj_reg];
+            DxValue obj_val = pinned_regs[obj_reg];
             DxObject *obj = (obj_val.tag == DX_VAL_OBJ) ? obj_val.obj : NULL;
             if (!obj) {
                 null_access_count++;
@@ -2427,7 +2667,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                     exec_result = DX_ERR_INTERNAL;
                     goto done;
                 }
-                frame->registers[dst] = (opcode == 0x54) ? DX_NULL_VALUE : DX_INT_VALUE(0);
+                pinned_regs[dst] = (opcode == 0x54) ? DX_NULL_VALUE : DX_INT_VALUE(0);
                 pc += 2;
                 DISPATCH_NEXT;
             }
@@ -2436,9 +2676,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             DxValue val;
             DxResult fr = dx_vm_get_field(obj, fname, &val);
             if (fr == DX_OK) {
-                frame->registers[dst] = val;
+                pinned_regs[dst] = val;
             } else {
-                frame->registers[dst] = (opcode == 0x54) ? DX_NULL_VALUE : DX_INT_VALUE(0);
+                pinned_regs[dst] = (opcode == 0x54) ? DX_NULL_VALUE : DX_INT_VALUE(0);
             }
             pc += 2;
             DISPATCH_NEXT;
@@ -2465,7 +2705,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint16_t field_idx = code[pc + 1];
             CHECK_REG(src); CHECK_REG(obj_reg);
 
-            DxValue obj_val = frame->registers[obj_reg];
+            DxValue obj_val = pinned_regs[obj_reg];
             DxObject *obj = (obj_val.tag == DX_VAL_OBJ) ? obj_val.obj : NULL;
             if (!obj) {
                 null_access_count++;
@@ -2485,7 +2725,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             }
 
             const char *fname = dx_dex_get_field_name(cur_dex, field_idx);
-            dx_vm_set_field(obj, fname, frame->registers[src]);
+            dx_vm_set_field(obj, fname, pinned_regs[src]);
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -2591,7 +2831,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst] = DX_INT_VALUE(-frame->registers[src].i);
+            pinned_regs[dst] = DX_INT_VALUE(-pinned_regs[src].i);
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2602,7 +2842,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst] = DX_INT_VALUE(~frame->registers[src].i);
+            pinned_regs[dst] = DX_INT_VALUE(~pinned_regs[src].i);
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2613,8 +2853,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst].tag = DX_VAL_LONG;
-            frame->registers[dst].l = -frame->registers[src].l;
+            pinned_regs[dst].tag = DX_VAL_LONG;
+            pinned_regs[dst].l = -pinned_regs[src].l;
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2625,8 +2865,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst].tag = DX_VAL_LONG;
-            frame->registers[dst].l = ~frame->registers[src].l;
+            pinned_regs[dst].tag = DX_VAL_LONG;
+            pinned_regs[dst].l = ~pinned_regs[src].l;
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2637,8 +2877,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst].tag = DX_VAL_FLOAT;
-            frame->registers[dst].f = -frame->registers[src].f;
+            pinned_regs[dst].tag = DX_VAL_FLOAT;
+            pinned_regs[dst].f = -pinned_regs[src].f;
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2649,8 +2889,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst].tag = DX_VAL_DOUBLE;
-            frame->registers[dst].d = -frame->registers[src].d;
+            pinned_regs[dst].tag = DX_VAL_DOUBLE;
+            pinned_regs[dst].d = -pinned_regs[src].d;
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2661,8 +2901,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst].tag = DX_VAL_LONG;
-            frame->registers[dst].l = (int64_t)frame->registers[src].i;
+            pinned_regs[dst].tag = DX_VAL_LONG;
+            pinned_regs[dst].l = (int64_t)pinned_regs[src].i;
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2673,8 +2913,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst].tag = DX_VAL_FLOAT;
-            frame->registers[dst].f = (float)frame->registers[src].i;
+            pinned_regs[dst].tag = DX_VAL_FLOAT;
+            pinned_regs[dst].f = (float)pinned_regs[src].i;
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2685,8 +2925,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst].tag = DX_VAL_DOUBLE;
-            frame->registers[dst].d = (double)frame->registers[src].i;
+            pinned_regs[dst].tag = DX_VAL_DOUBLE;
+            pinned_regs[dst].d = (double)pinned_regs[src].i;
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2697,7 +2937,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst] = DX_INT_VALUE((int32_t)frame->registers[src].l);
+            pinned_regs[dst] = DX_INT_VALUE((int32_t)pinned_regs[src].l);
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2708,8 +2948,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst].tag = DX_VAL_FLOAT;
-            frame->registers[dst].f = (float)frame->registers[src].l;
+            pinned_regs[dst].tag = DX_VAL_FLOAT;
+            pinned_regs[dst].f = (float)pinned_regs[src].l;
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2720,8 +2960,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst].tag = DX_VAL_DOUBLE;
-            frame->registers[dst].d = (double)frame->registers[src].l;
+            pinned_regs[dst].tag = DX_VAL_DOUBLE;
+            pinned_regs[dst].d = (double)pinned_regs[src].l;
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2732,7 +2972,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst] = DX_INT_VALUE((int32_t)frame->registers[src].f);
+            pinned_regs[dst] = DX_INT_VALUE((int32_t)pinned_regs[src].f);
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2743,8 +2983,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst].tag = DX_VAL_LONG;
-            frame->registers[dst].l = (int64_t)frame->registers[src].f;
+            pinned_regs[dst].tag = DX_VAL_LONG;
+            pinned_regs[dst].l = (int64_t)pinned_regs[src].f;
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2755,8 +2995,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst].tag = DX_VAL_DOUBLE;
-            frame->registers[dst].d = (double)frame->registers[src].f;
+            pinned_regs[dst].tag = DX_VAL_DOUBLE;
+            pinned_regs[dst].d = (double)pinned_regs[src].f;
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2767,7 +3007,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst] = DX_INT_VALUE((int32_t)frame->registers[src].d);
+            pinned_regs[dst] = DX_INT_VALUE((int32_t)pinned_regs[src].d);
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2778,8 +3018,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst].tag = DX_VAL_LONG;
-            frame->registers[dst].l = (int64_t)frame->registers[src].d;
+            pinned_regs[dst].tag = DX_VAL_LONG;
+            pinned_regs[dst].l = (int64_t)pinned_regs[src].d;
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2790,8 +3030,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst].tag = DX_VAL_FLOAT;
-            frame->registers[dst].f = (float)frame->registers[src].d;
+            pinned_regs[dst].tag = DX_VAL_FLOAT;
+            pinned_regs[dst].f = (float)pinned_regs[src].d;
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2802,7 +3042,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst] = DX_INT_VALUE((int32_t)(int8_t)(frame->registers[src].i & 0xFF));
+            pinned_regs[dst] = DX_INT_VALUE((int32_t)(int8_t)(pinned_regs[src].i & 0xFF));
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2813,7 +3053,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst] = DX_INT_VALUE((int32_t)(uint16_t)(frame->registers[src].i & 0xFFFF));
+            pinned_regs[dst] = DX_INT_VALUE((int32_t)(uint16_t)(pinned_regs[src].i & 0xFFFF));
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2824,7 +3064,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
-            frame->registers[dst] = DX_INT_VALUE((int32_t)(int16_t)(frame->registers[src].i & 0xFFFF));
+            pinned_regs[dst] = DX_INT_VALUE((int32_t)(int16_t)(pinned_regs[src].i & 0xFFFF));
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -2897,8 +3137,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t dst = (inst >> 8) & 0xFF;
             uint8_t b = code[pc + 1] & 0xFF;
             uint8_t c = (code[pc + 1] >> 8) & 0xFF;
-            int32_t vb = frame->registers[b].i;
-            int32_t vc = frame->registers[c].i;
+            int32_t vb = pinned_regs[b].i;
+            int32_t vc = pinned_regs[c].i;
             int32_t r = 0;
             bool use_int = true;
             switch (opcode) {
@@ -2938,13 +3178,13 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 case 0x99: r = vb >> (vc & 0x1F); break; // shr-int
                 case 0x9A: r = (int32_t)((uint32_t)vb >> (vc & 0x1F)); break; // ushr-int
                 // Long operations
-                case 0x9B: { int64_t lb = frame->registers[b].l; int64_t lc = frame->registers[c].l;
-                    frame->registers[dst].tag = DX_VAL_LONG; frame->registers[dst].l = lb + lc; use_int = false; break; }
-                case 0x9C: { int64_t lb = frame->registers[b].l; int64_t lc = frame->registers[c].l;
-                    frame->registers[dst].tag = DX_VAL_LONG; frame->registers[dst].l = lb - lc; use_int = false; break; }
-                case 0x9D: { int64_t lb = frame->registers[b].l; int64_t lc = frame->registers[c].l;
-                    frame->registers[dst].tag = DX_VAL_LONG; frame->registers[dst].l = lb * lc; use_int = false; break; }
-                case 0x9E: { int64_t lb = frame->registers[b].l; int64_t lc = frame->registers[c].l;
+                case 0x9B: { int64_t lb = pinned_regs[b].l; int64_t lc = pinned_regs[c].l;
+                    pinned_regs[dst].tag = DX_VAL_LONG; pinned_regs[dst].l = lb + lc; use_int = false; break; }
+                case 0x9C: { int64_t lb = pinned_regs[b].l; int64_t lc = pinned_regs[c].l;
+                    pinned_regs[dst].tag = DX_VAL_LONG; pinned_regs[dst].l = lb - lc; use_int = false; break; }
+                case 0x9D: { int64_t lb = pinned_regs[b].l; int64_t lc = pinned_regs[c].l;
+                    pinned_regs[dst].tag = DX_VAL_LONG; pinned_regs[dst].l = lb * lc; use_int = false; break; }
+                case 0x9E: { int64_t lb = pinned_regs[b].l; int64_t lc = pinned_regs[c].l;
                     if (lc == 0) {
                         DxObject *exc = dx_vm_create_exception(vm, "Ljava/lang/ArithmeticException;", "divide by zero");
                         if (exc && method->code.tries_size > 0) {
@@ -2956,10 +3196,10 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                         goto done;
                     }
                     // LLONG_MIN / -1 = LLONG_MIN in Java
-                    frame->registers[dst].tag = DX_VAL_LONG;
-                    frame->registers[dst].l = (lb == INT64_MIN && lc == -1) ? INT64_MIN : lb / lc;
+                    pinned_regs[dst].tag = DX_VAL_LONG;
+                    pinned_regs[dst].l = (lb == INT64_MIN && lc == -1) ? INT64_MIN : lb / lc;
                     use_int = false; break; }
-                case 0x9F: { int64_t lb = frame->registers[b].l; int64_t lc = frame->registers[c].l;
+                case 0x9F: { int64_t lb = pinned_regs[b].l; int64_t lc = pinned_regs[c].l;
                     if (lc == 0) {
                         DxObject *exc = dx_vm_create_exception(vm, "Ljava/lang/ArithmeticException;", "divide by zero");
                         if (exc && method->code.tries_size > 0) {
@@ -2970,46 +3210,46 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                         if (exc) { vm->pending_exception = exc; exec_result = DX_ERR_EXCEPTION; goto done; }
                         goto done;
                     }
-                    frame->registers[dst].tag = DX_VAL_LONG;
-                    frame->registers[dst].l = (lb == INT64_MIN && lc == -1) ? 0 : lb % lc;
+                    pinned_regs[dst].tag = DX_VAL_LONG;
+                    pinned_regs[dst].l = (lb == INT64_MIN && lc == -1) ? 0 : lb % lc;
                     use_int = false; break; }
-                case 0xA0: { int64_t lb = frame->registers[b].l; int64_t lc = frame->registers[c].l;
-                    frame->registers[dst].tag = DX_VAL_LONG; frame->registers[dst].l = lb & lc; use_int = false; break; }
-                case 0xA1: { int64_t lb = frame->registers[b].l; int64_t lc = frame->registers[c].l;
-                    frame->registers[dst].tag = DX_VAL_LONG; frame->registers[dst].l = lb | lc; use_int = false; break; }
-                case 0xA2: { int64_t lb = frame->registers[b].l; int64_t lc = frame->registers[c].l;
-                    frame->registers[dst].tag = DX_VAL_LONG; frame->registers[dst].l = lb ^ lc; use_int = false; break; }
-                case 0xA3: { int64_t lb = frame->registers[b].l; int32_t shift = frame->registers[c].i;
-                    frame->registers[dst].tag = DX_VAL_LONG; frame->registers[dst].l = lb << (shift & 0x3F); use_int = false; break; }
-                case 0xA4: { int64_t lb = frame->registers[b].l; int32_t shift = frame->registers[c].i;
-                    frame->registers[dst].tag = DX_VAL_LONG; frame->registers[dst].l = lb >> (shift & 0x3F); use_int = false; break; }
-                case 0xA5: { int64_t lb = frame->registers[b].l; int32_t shift = frame->registers[c].i;
-                    frame->registers[dst].tag = DX_VAL_LONG; frame->registers[dst].l = (int64_t)((uint64_t)lb >> (shift & 0x3F)); use_int = false; break; }
+                case 0xA0: { int64_t lb = pinned_regs[b].l; int64_t lc = pinned_regs[c].l;
+                    pinned_regs[dst].tag = DX_VAL_LONG; pinned_regs[dst].l = lb & lc; use_int = false; break; }
+                case 0xA1: { int64_t lb = pinned_regs[b].l; int64_t lc = pinned_regs[c].l;
+                    pinned_regs[dst].tag = DX_VAL_LONG; pinned_regs[dst].l = lb | lc; use_int = false; break; }
+                case 0xA2: { int64_t lb = pinned_regs[b].l; int64_t lc = pinned_regs[c].l;
+                    pinned_regs[dst].tag = DX_VAL_LONG; pinned_regs[dst].l = lb ^ lc; use_int = false; break; }
+                case 0xA3: { int64_t lb = pinned_regs[b].l; int32_t shift = pinned_regs[c].i;
+                    pinned_regs[dst].tag = DX_VAL_LONG; pinned_regs[dst].l = lb << (shift & 0x3F); use_int = false; break; }
+                case 0xA4: { int64_t lb = pinned_regs[b].l; int32_t shift = pinned_regs[c].i;
+                    pinned_regs[dst].tag = DX_VAL_LONG; pinned_regs[dst].l = lb >> (shift & 0x3F); use_int = false; break; }
+                case 0xA5: { int64_t lb = pinned_regs[b].l; int32_t shift = pinned_regs[c].i;
+                    pinned_regs[dst].tag = DX_VAL_LONG; pinned_regs[dst].l = (int64_t)((uint64_t)lb >> (shift & 0x3F)); use_int = false; break; }
                 // Float operations
-                case 0xA6: { float fb = frame->registers[b].f; float fc = frame->registers[c].f;
-                    frame->registers[dst].tag = DX_VAL_FLOAT; frame->registers[dst].f = fb + fc; use_int = false; break; }
-                case 0xA7: { float fb = frame->registers[b].f; float fc = frame->registers[c].f;
-                    frame->registers[dst].tag = DX_VAL_FLOAT; frame->registers[dst].f = fb - fc; use_int = false; break; }
-                case 0xA8: { float fb = frame->registers[b].f; float fc = frame->registers[c].f;
-                    frame->registers[dst].tag = DX_VAL_FLOAT; frame->registers[dst].f = fb * fc; use_int = false; break; }
-                case 0xA9: { float fb = frame->registers[b].f; float fc = frame->registers[c].f;
-                    frame->registers[dst].tag = DX_VAL_FLOAT; frame->registers[dst].f = fc != 0 ? fb / fc : 0; use_int = false; break; }
-                case 0xAA: { float fb = frame->registers[b].f; float fc = frame->registers[c].f;
-                    frame->registers[dst].tag = DX_VAL_FLOAT; frame->registers[dst].f = fmodf(fb, fc); use_int = false; break; }
+                case 0xA6: { float fb = pinned_regs[b].f; float fc = pinned_regs[c].f;
+                    pinned_regs[dst].tag = DX_VAL_FLOAT; pinned_regs[dst].f = fb + fc; use_int = false; break; }
+                case 0xA7: { float fb = pinned_regs[b].f; float fc = pinned_regs[c].f;
+                    pinned_regs[dst].tag = DX_VAL_FLOAT; pinned_regs[dst].f = fb - fc; use_int = false; break; }
+                case 0xA8: { float fb = pinned_regs[b].f; float fc = pinned_regs[c].f;
+                    pinned_regs[dst].tag = DX_VAL_FLOAT; pinned_regs[dst].f = fb * fc; use_int = false; break; }
+                case 0xA9: { float fb = pinned_regs[b].f; float fc = pinned_regs[c].f;
+                    pinned_regs[dst].tag = DX_VAL_FLOAT; pinned_regs[dst].f = fc != 0 ? fb / fc : 0; use_int = false; break; }
+                case 0xAA: { float fb = pinned_regs[b].f; float fc = pinned_regs[c].f;
+                    pinned_regs[dst].tag = DX_VAL_FLOAT; pinned_regs[dst].f = fmodf(fb, fc); use_int = false; break; }
                 // Double operations
-                case 0xAB: { double db = frame->registers[b].d; double dc = frame->registers[c].d;
-                    frame->registers[dst].tag = DX_VAL_DOUBLE; frame->registers[dst].d = db + dc; use_int = false; break; }
-                case 0xAC: { double db = frame->registers[b].d; double dc = frame->registers[c].d;
-                    frame->registers[dst].tag = DX_VAL_DOUBLE; frame->registers[dst].d = db - dc; use_int = false; break; }
-                case 0xAD: { double db = frame->registers[b].d; double dc = frame->registers[c].d;
-                    frame->registers[dst].tag = DX_VAL_DOUBLE; frame->registers[dst].d = db * dc; use_int = false; break; }
-                case 0xAE: { double db = frame->registers[b].d; double dc = frame->registers[c].d;
-                    frame->registers[dst].tag = DX_VAL_DOUBLE; frame->registers[dst].d = dc != 0 ? db / dc : 0; use_int = false; break; }
-                case 0xAF: { double db = frame->registers[b].d; double dc = frame->registers[c].d;
-                    frame->registers[dst].tag = DX_VAL_DOUBLE; frame->registers[dst].d = fmod(db, dc); use_int = false; break; }
+                case 0xAB: { double db = pinned_regs[b].d; double dc = pinned_regs[c].d;
+                    pinned_regs[dst].tag = DX_VAL_DOUBLE; pinned_regs[dst].d = db + dc; use_int = false; break; }
+                case 0xAC: { double db = pinned_regs[b].d; double dc = pinned_regs[c].d;
+                    pinned_regs[dst].tag = DX_VAL_DOUBLE; pinned_regs[dst].d = db - dc; use_int = false; break; }
+                case 0xAD: { double db = pinned_regs[b].d; double dc = pinned_regs[c].d;
+                    pinned_regs[dst].tag = DX_VAL_DOUBLE; pinned_regs[dst].d = db * dc; use_int = false; break; }
+                case 0xAE: { double db = pinned_regs[b].d; double dc = pinned_regs[c].d;
+                    pinned_regs[dst].tag = DX_VAL_DOUBLE; pinned_regs[dst].d = dc != 0 ? db / dc : 0; use_int = false; break; }
+                case 0xAF: { double db = pinned_regs[b].d; double dc = pinned_regs[c].d;
+                    pinned_regs[dst].tag = DX_VAL_DOUBLE; pinned_regs[dst].d = fmod(db, dc); use_int = false; break; }
                 default: r = 0; break;
             }
-            if (use_int) frame->registers[dst] = DX_INT_VALUE(r);
+            if (use_int) pinned_regs[dst] = DX_INT_VALUE(r);
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -3081,8 +3321,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t a = (inst >> 8) & 0x0F;
             uint8_t b = (inst >> 12) & 0x0F;
-            int32_t va = frame->registers[a].i;
-            int32_t vb = frame->registers[b].i;
+            int32_t va = pinned_regs[a].i;
+            int32_t vb = pinned_regs[b].i;
             int32_t r = 0;
             bool use_int_2addr = true;
             switch (opcode) {
@@ -3120,13 +3360,13 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 case 0xB9: r = va >> (vb & 0x1F); break; // shr-int/2addr
                 case 0xBA: r = (int32_t)((uint32_t)va >> (vb & 0x1F)); break; // ushr-int/2addr
                 // Long operations /2addr
-                case 0xBB: { int64_t la = frame->registers[a].l; int64_t lb = frame->registers[b].l;
-                    frame->registers[a].tag = DX_VAL_LONG; frame->registers[a].l = la + lb; use_int_2addr = false; break; }
-                case 0xBC: { int64_t la = frame->registers[a].l; int64_t lb = frame->registers[b].l;
-                    frame->registers[a].tag = DX_VAL_LONG; frame->registers[a].l = la - lb; use_int_2addr = false; break; }
-                case 0xBD: { int64_t la = frame->registers[a].l; int64_t lb = frame->registers[b].l;
-                    frame->registers[a].tag = DX_VAL_LONG; frame->registers[a].l = la * lb; use_int_2addr = false; break; }
-                case 0xBE: { int64_t la = frame->registers[a].l; int64_t lb2 = frame->registers[b].l;
+                case 0xBB: { int64_t la = pinned_regs[a].l; int64_t lb = pinned_regs[b].l;
+                    pinned_regs[a].tag = DX_VAL_LONG; pinned_regs[a].l = la + lb; use_int_2addr = false; break; }
+                case 0xBC: { int64_t la = pinned_regs[a].l; int64_t lb = pinned_regs[b].l;
+                    pinned_regs[a].tag = DX_VAL_LONG; pinned_regs[a].l = la - lb; use_int_2addr = false; break; }
+                case 0xBD: { int64_t la = pinned_regs[a].l; int64_t lb = pinned_regs[b].l;
+                    pinned_regs[a].tag = DX_VAL_LONG; pinned_regs[a].l = la * lb; use_int_2addr = false; break; }
+                case 0xBE: { int64_t la = pinned_regs[a].l; int64_t lb2 = pinned_regs[b].l;
                     if (lb2 == 0) {
                         DxObject *exc = dx_vm_create_exception(vm, "Ljava/lang/ArithmeticException;", "divide by zero");
                         if (exc && method->code.tries_size > 0) {
@@ -3137,10 +3377,10 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                         if (exc) { vm->pending_exception = exc; exec_result = DX_ERR_EXCEPTION; goto done; }
                         goto done;
                     }
-                    frame->registers[a].tag = DX_VAL_LONG;
-                    frame->registers[a].l = (la == INT64_MIN && lb2 == -1) ? INT64_MIN : la / lb2;
+                    pinned_regs[a].tag = DX_VAL_LONG;
+                    pinned_regs[a].l = (la == INT64_MIN && lb2 == -1) ? INT64_MIN : la / lb2;
                     use_int_2addr = false; break; }
-                case 0xBF: { int64_t la = frame->registers[a].l; int64_t lb2 = frame->registers[b].l;
+                case 0xBF: { int64_t la = pinned_regs[a].l; int64_t lb2 = pinned_regs[b].l;
                     if (lb2 == 0) {
                         DxObject *exc = dx_vm_create_exception(vm, "Ljava/lang/ArithmeticException;", "divide by zero");
                         if (exc && method->code.tries_size > 0) {
@@ -3151,46 +3391,46 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                         if (exc) { vm->pending_exception = exc; exec_result = DX_ERR_EXCEPTION; goto done; }
                         goto done;
                     }
-                    frame->registers[a].tag = DX_VAL_LONG;
-                    frame->registers[a].l = (la == INT64_MIN && lb2 == -1) ? 0 : la % lb2;
+                    pinned_regs[a].tag = DX_VAL_LONG;
+                    pinned_regs[a].l = (la == INT64_MIN && lb2 == -1) ? 0 : la % lb2;
                     use_int_2addr = false; break; }
-                case 0xC0: { int64_t la = frame->registers[a].l; int64_t lb = frame->registers[b].l;
-                    frame->registers[a].tag = DX_VAL_LONG; frame->registers[a].l = la & lb; use_int_2addr = false; break; }
-                case 0xC1: { int64_t la = frame->registers[a].l; int64_t lb = frame->registers[b].l;
-                    frame->registers[a].tag = DX_VAL_LONG; frame->registers[a].l = la | lb; use_int_2addr = false; break; }
-                case 0xC2: { int64_t la = frame->registers[a].l; int64_t lb = frame->registers[b].l;
-                    frame->registers[a].tag = DX_VAL_LONG; frame->registers[a].l = la ^ lb; use_int_2addr = false; break; }
-                case 0xC3: { int64_t la = frame->registers[a].l; int32_t shift = frame->registers[b].i;
-                    frame->registers[a].tag = DX_VAL_LONG; frame->registers[a].l = la << (shift & 0x3F); use_int_2addr = false; break; }
-                case 0xC4: { int64_t la = frame->registers[a].l; int32_t shift = frame->registers[b].i;
-                    frame->registers[a].tag = DX_VAL_LONG; frame->registers[a].l = la >> (shift & 0x3F); use_int_2addr = false; break; }
-                case 0xC5: { int64_t la = frame->registers[a].l; int32_t shift = frame->registers[b].i;
-                    frame->registers[a].tag = DX_VAL_LONG; frame->registers[a].l = (int64_t)((uint64_t)la >> (shift & 0x3F)); use_int_2addr = false; break; }
+                case 0xC0: { int64_t la = pinned_regs[a].l; int64_t lb = pinned_regs[b].l;
+                    pinned_regs[a].tag = DX_VAL_LONG; pinned_regs[a].l = la & lb; use_int_2addr = false; break; }
+                case 0xC1: { int64_t la = pinned_regs[a].l; int64_t lb = pinned_regs[b].l;
+                    pinned_regs[a].tag = DX_VAL_LONG; pinned_regs[a].l = la | lb; use_int_2addr = false; break; }
+                case 0xC2: { int64_t la = pinned_regs[a].l; int64_t lb = pinned_regs[b].l;
+                    pinned_regs[a].tag = DX_VAL_LONG; pinned_regs[a].l = la ^ lb; use_int_2addr = false; break; }
+                case 0xC3: { int64_t la = pinned_regs[a].l; int32_t shift = pinned_regs[b].i;
+                    pinned_regs[a].tag = DX_VAL_LONG; pinned_regs[a].l = la << (shift & 0x3F); use_int_2addr = false; break; }
+                case 0xC4: { int64_t la = pinned_regs[a].l; int32_t shift = pinned_regs[b].i;
+                    pinned_regs[a].tag = DX_VAL_LONG; pinned_regs[a].l = la >> (shift & 0x3F); use_int_2addr = false; break; }
+                case 0xC5: { int64_t la = pinned_regs[a].l; int32_t shift = pinned_regs[b].i;
+                    pinned_regs[a].tag = DX_VAL_LONG; pinned_regs[a].l = (int64_t)((uint64_t)la >> (shift & 0x3F)); use_int_2addr = false; break; }
                 // Float operations /2addr
-                case 0xC6: { float fa = frame->registers[a].f; float fb2 = frame->registers[b].f;
-                    frame->registers[a].tag = DX_VAL_FLOAT; frame->registers[a].f = fa + fb2; use_int_2addr = false; break; }
-                case 0xC7: { float fa = frame->registers[a].f; float fb2 = frame->registers[b].f;
-                    frame->registers[a].tag = DX_VAL_FLOAT; frame->registers[a].f = fa - fb2; use_int_2addr = false; break; }
-                case 0xC8: { float fa = frame->registers[a].f; float fb2 = frame->registers[b].f;
-                    frame->registers[a].tag = DX_VAL_FLOAT; frame->registers[a].f = fa * fb2; use_int_2addr = false; break; }
-                case 0xC9: { float fa = frame->registers[a].f; float fb2 = frame->registers[b].f;
-                    frame->registers[a].tag = DX_VAL_FLOAT; frame->registers[a].f = fb2 != 0 ? fa / fb2 : 0; use_int_2addr = false; break; }
-                case 0xCA: { float fa = frame->registers[a].f; float fb2 = frame->registers[b].f;
-                    frame->registers[a].tag = DX_VAL_FLOAT; frame->registers[a].f = fmodf(fa, fb2); use_int_2addr = false; break; }
+                case 0xC6: { float fa = pinned_regs[a].f; float fb2 = pinned_regs[b].f;
+                    pinned_regs[a].tag = DX_VAL_FLOAT; pinned_regs[a].f = fa + fb2; use_int_2addr = false; break; }
+                case 0xC7: { float fa = pinned_regs[a].f; float fb2 = pinned_regs[b].f;
+                    pinned_regs[a].tag = DX_VAL_FLOAT; pinned_regs[a].f = fa - fb2; use_int_2addr = false; break; }
+                case 0xC8: { float fa = pinned_regs[a].f; float fb2 = pinned_regs[b].f;
+                    pinned_regs[a].tag = DX_VAL_FLOAT; pinned_regs[a].f = fa * fb2; use_int_2addr = false; break; }
+                case 0xC9: { float fa = pinned_regs[a].f; float fb2 = pinned_regs[b].f;
+                    pinned_regs[a].tag = DX_VAL_FLOAT; pinned_regs[a].f = fb2 != 0 ? fa / fb2 : 0; use_int_2addr = false; break; }
+                case 0xCA: { float fa = pinned_regs[a].f; float fb2 = pinned_regs[b].f;
+                    pinned_regs[a].tag = DX_VAL_FLOAT; pinned_regs[a].f = fmodf(fa, fb2); use_int_2addr = false; break; }
                 // Double operations /2addr
-                case 0xCB: { double da = frame->registers[a].d; double db2 = frame->registers[b].d;
-                    frame->registers[a].tag = DX_VAL_DOUBLE; frame->registers[a].d = da + db2; use_int_2addr = false; break; }
-                case 0xCC: { double da = frame->registers[a].d; double db2 = frame->registers[b].d;
-                    frame->registers[a].tag = DX_VAL_DOUBLE; frame->registers[a].d = da - db2; use_int_2addr = false; break; }
-                case 0xCD: { double da = frame->registers[a].d; double db2 = frame->registers[b].d;
-                    frame->registers[a].tag = DX_VAL_DOUBLE; frame->registers[a].d = da * db2; use_int_2addr = false; break; }
-                case 0xCE: { double da = frame->registers[a].d; double db2 = frame->registers[b].d;
-                    frame->registers[a].tag = DX_VAL_DOUBLE; frame->registers[a].d = db2 != 0 ? da / db2 : 0; use_int_2addr = false; break; }
-                case 0xCF: { double da = frame->registers[a].d; double db2 = frame->registers[b].d;
-                    frame->registers[a].tag = DX_VAL_DOUBLE; frame->registers[a].d = fmod(da, db2); use_int_2addr = false; break; }
+                case 0xCB: { double da = pinned_regs[a].d; double db2 = pinned_regs[b].d;
+                    pinned_regs[a].tag = DX_VAL_DOUBLE; pinned_regs[a].d = da + db2; use_int_2addr = false; break; }
+                case 0xCC: { double da = pinned_regs[a].d; double db2 = pinned_regs[b].d;
+                    pinned_regs[a].tag = DX_VAL_DOUBLE; pinned_regs[a].d = da - db2; use_int_2addr = false; break; }
+                case 0xCD: { double da = pinned_regs[a].d; double db2 = pinned_regs[b].d;
+                    pinned_regs[a].tag = DX_VAL_DOUBLE; pinned_regs[a].d = da * db2; use_int_2addr = false; break; }
+                case 0xCE: { double da = pinned_regs[a].d; double db2 = pinned_regs[b].d;
+                    pinned_regs[a].tag = DX_VAL_DOUBLE; pinned_regs[a].d = db2 != 0 ? da / db2 : 0; use_int_2addr = false; break; }
+                case 0xCF: { double da = pinned_regs[a].d; double db2 = pinned_regs[b].d;
+                    pinned_regs[a].tag = DX_VAL_DOUBLE; pinned_regs[a].d = fmod(da, db2); use_int_2addr = false; break; }
                 default: r = 0; break;
             }
-            if (use_int_2addr) frame->registers[a] = DX_INT_VALUE(r);
+            if (use_int_2addr) pinned_regs[a] = DX_INT_VALUE(r);
             pc += 1;
             DISPATCH_NEXT;
         }
@@ -3215,7 +3455,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t dst = (inst >> 8) & 0x0F;
             uint8_t src = (inst >> 12) & 0x0F;
             int16_t lit = (int16_t)code[pc + 1];
-            int32_t va = frame->registers[src].i;
+            int32_t va = pinned_regs[src].i;
             int32_t r = 0;
             switch (opcode) {
                 case 0xD0: r = va + lit; break; // add-int/lit16
@@ -3227,7 +3467,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 case 0xD6: r = va | lit; break; // or-int/lit16
                 case 0xD7: r = va ^ lit; break; // xor-int/lit16
             }
-            frame->registers[dst] = DX_INT_VALUE(r);
+            pinned_regs[dst] = DX_INT_VALUE(r);
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -3259,7 +3499,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t dst = (inst >> 8) & 0xFF;
             uint8_t src = code[pc + 1] & 0xFF;
             int8_t lit = (int8_t)((code[pc + 1] >> 8) & 0xFF);
-            int32_t va = frame->registers[src].i;
+            int32_t va = pinned_regs[src].i;
             int32_t r = 0;
             switch (opcode) {
                 case 0xD8: r = va + lit; break; // add-int/lit8
@@ -3274,7 +3514,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 case 0xE1: r = va >> (lit & 0x1F); break; // shr-int/lit8
                 case 0xE2: r = (int32_t)((uint32_t)va >> (lit & 0x1F)); break; // ushr-int/lit8
             }
-            frame->registers[dst] = DX_INT_VALUE(r);
+            pinned_regs[dst] = DX_INT_VALUE(r);
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -3302,8 +3542,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 DISPATCH_NEXT;
             }
 
-            DxObject *mh_obj = (frame->registers[poly_arg_regs[0]].tag == DX_VAL_OBJ)
-                               ? frame->registers[poly_arg_regs[0]].obj : NULL;
+            DxObject *mh_obj = (pinned_regs[poly_arg_regs[0]].tag == DX_VAL_OBJ)
+                               ? pinned_regs[poly_arg_regs[0]].obj : NULL;
             if (!mh_obj) {
                 DX_WARN(TAG, "invoke-polymorphic: null MethodHandle at v%u", poly_arg_regs[0]);
                 frame->result = DX_NULL_VALUE;
@@ -3322,7 +3562,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t call_argc = poly_argc - 1;
             DxValue call_args[5];
             for (uint8_t ai = 0; ai < call_argc && ai < 5; ai++) {
-                call_args[ai] = frame->registers[poly_arg_regs[ai + 1]];
+                call_args[ai] = pinned_regs[poly_arg_regs[ai + 1]];
             }
 
             DxValue poly_result;
@@ -3359,8 +3599,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 DISPATCH_NEXT;
             }
 
-            DxObject *mh_obj_r = (frame->registers[first_reg].tag == DX_VAL_OBJ)
-                                 ? frame->registers[first_reg].obj : NULL;
+            DxObject *mh_obj_r = (pinned_regs[first_reg].tag == DX_VAL_OBJ)
+                                 ? pinned_regs[first_reg].obj : NULL;
             if (!mh_obj_r) {
                 DX_WARN(TAG, "invoke-polymorphic/range: null MethodHandle at v%u", first_reg);
                 frame->result = DX_NULL_VALUE;
@@ -3379,7 +3619,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             if (call_argc_r > DX_MAX_REGISTERS) call_argc_r = DX_MAX_REGISTERS;
             DxValue range_call_args[DX_MAX_REGISTERS];
             for (uint32_t ai = 0; ai < call_argc_r; ai++) {
-                range_call_args[ai] = frame->registers[first_reg + 1 + ai];
+                range_call_args[ai] = pinned_regs[first_reg + 1 + ai];
             }
 
             DxValue poly_result_r;
@@ -3408,7 +3648,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 
             DxValue ic_args[5];
             for (uint8_t ai = 0; ai < argc && ai < 5; ai++) {
-                ic_args[ai] = frame->registers[arg_regs[ai]];
+                ic_args[ai] = pinned_regs[arg_regs[ai]];
             }
 
             exec_result = dx_vm_invoke_custom(vm, frame, call_site_idx, ic_args, argc);
@@ -3431,7 +3671,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint32_t actual_argc = argc;
             if (actual_argc > DX_MAX_REGISTERS) actual_argc = DX_MAX_REGISTERS;
             for (uint32_t ai = 0; ai < actual_argc; ai++) {
-                ic_args[ai] = frame->registers[first_reg + ai];
+                ic_args[ai] = pinned_regs[first_reg + ai];
             }
 
             exec_result = dx_vm_invoke_custom(vm, frame, call_site_idx, ic_args, actual_argc);
@@ -3471,11 +3711,11 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                     mh_obj->fields[2].tag = DX_VAL_LONG;
                     mh_obj->fields[2].l = (int64_t)(uintptr_t)cur_dex;
                 }
-                frame->registers[mh_dst] = mh_obj ? DX_OBJ_VALUE(mh_obj) : DX_NULL_VALUE;
+                pinned_regs[mh_dst] = mh_obj ? DX_OBJ_VALUE(mh_obj) : DX_NULL_VALUE;
             } else {
                 DX_WARN(TAG, "const-method-handle: index %u out of range (count=%u)",
                          mh_idx, cur_dex ? cur_dex->method_handle_count : 0);
-                frame->registers[mh_dst] = DX_NULL_VALUE;
+                pinned_regs[mh_dst] = DX_NULL_VALUE;
             }
             pc += 2;
             DISPATCH_NEXT;
@@ -3503,11 +3743,11 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                         mt_obj->klass = mt_cls;
                     }
                 }
-                frame->registers[mt_dst] = mt_obj ? DX_OBJ_VALUE(mt_obj) : DX_NULL_VALUE;
+                pinned_regs[mt_dst] = mt_obj ? DX_OBJ_VALUE(mt_obj) : DX_NULL_VALUE;
             } else {
                 DX_WARN(TAG, "const-method-type: proto index %u out of range (count=%u)",
                          mt_proto_idx, cur_dex ? cur_dex->proto_count : 0);
-                frame->registers[mt_dst] = DX_NULL_VALUE;
+                pinned_regs[mt_dst] = DX_NULL_VALUE;
             }
             pc += 2;
             DISPATCH_NEXT;
@@ -3605,6 +3845,13 @@ done:
             sf = sf->caller;
             depth++;
         }
+    }
+
+    // Profiling: accumulate method execution time
+    if (vm->profiling_enabled && _prof_start_ns > 0) {
+        uint64_t elapsed_ns = dx_current_time_ns() - _prof_start_ns;
+        method->total_time_ns += elapsed_ns;
+        method->call_count++;
     }
 
     // Debug tracing: method exit

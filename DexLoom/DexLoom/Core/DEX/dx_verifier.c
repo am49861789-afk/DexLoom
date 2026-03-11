@@ -11,8 +11,8 @@ static bool is_supported_opcode(uint8_t op) {
     return true; // interpreter handles all opcodes via default skip path
 }
 
-// Verify a code item's bytecode is within our supported subset
-DxResult dx_verify_code(const DxDexFile *dex, const DxDexCodeItem *code, const char *method_name) {
+// Verify a code item's bytecode is within our supported subset (unused; retained for future use)
+static DxResult dx_verify_code(const DxDexFile *dex, const DxDexCodeItem *code, const char *method_name) {
     if (!code || !code->insns) return DX_ERR_NULL_PTR;
 
     uint32_t pc = 0;

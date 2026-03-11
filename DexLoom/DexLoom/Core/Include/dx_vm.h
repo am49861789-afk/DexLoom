@@ -39,6 +39,8 @@ struct DxClass {
         const char  *name;
         const char  *type;
         uint32_t     flags;
+        uint32_t     slot_index;    // precomputed absolute slot in obj->fields[]
+        bool         is_volatile;   // ACC_VOLATILE (0x0040) -- memory barrier semantics
     } *field_defs;
     DxValue         *static_fields;     // array[static_field_count]
 
@@ -52,6 +54,14 @@ struct DxClass {
     DxMethod       **vtable;
     uint32_t         vtable_size;
 
+    // ITable (interface method dispatch table)
+    struct {
+        const char *interface_desc;
+        DxMethod **methods;
+        int method_count;
+    } *itable;
+    int itable_count;
+
     // Annotations (with element values)
     DxAnnotationEntry *annotations;
     uint32_t annotation_count;
@@ -59,8 +69,36 @@ struct DxClass {
     // DEX origin
     DxDexFile       *dex_file;          // which DEX file this class came from
     uint32_t         dex_class_def_idx;
+    uint8_t          source_dex_idx;    // index into vm->dex_files[] this class came from
     bool             is_framework;      // true for built-in Android stubs
 };
+
+// Inline cache for monomorphic/polymorphic call site optimization
+#define DX_IC_SIZE 4  // max polymorphic cache entries per call site
+
+typedef struct {
+    DxClass  *receiver_class;
+    DxMethod *resolved_method;
+} DxICEntry;
+
+typedef struct {
+    DxICEntry entries[DX_IC_SIZE];
+    uint8_t   count;       // how many entries populated (0..DX_IC_SIZE)
+    uint32_t  hits;        // cache hit count
+    uint32_t  misses;      // cache miss count
+} DxInlineCache;
+
+// Inline cache table: maps PC offsets to inline caches within a method
+#define DX_IC_TABLE_SIZE 32  // hash table slots per method
+
+typedef struct {
+    uint32_t       pc;     // PC offset of the invoke instruction (0 = empty)
+    DxInlineCache  ic;
+} DxICSlot;
+
+typedef struct {
+    DxICSlot slots[DX_IC_TABLE_SIZE];
+} DxICTable;
 
 // Native method implementation signature
 typedef DxResult (*DxNativeMethodFn)(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
@@ -86,6 +124,18 @@ struct DxMethod {
 
     // VTable index (-1 if not virtual)
     int32_t            vtable_idx;
+
+    // Inline cache table for invoke-virtual/interface call sites
+    DxICTable         *ic_table;     // lazily allocated on first invoke-virtual
+
+    // Method inlining for trivial getters/setters
+    uint8_t            inline_type;       // 0=none, 1=getter, 2=setter
+    uint16_t           inline_field_idx;  // field index for inlined getter/setter
+    bool               analyzed_for_inline; // true after inline analysis performed
+
+    // Profiling: method-level execution time
+    uint64_t           total_time_ns;     // accumulated wall-clock time in this method
+    uint32_t           call_count;        // number of times this method was invoked
 
     // Annotations (with element values)
     DxAnnotationEntry *annotations;
@@ -185,10 +235,11 @@ struct DxVM {
     // Activity back-stack for startActivityForResult / finish
     #define DX_MAX_ACTIVITY_STACK 16
     struct {
-        DxObject *activity;     // the Activity object
-        DxObject *intent;       // Intent that launched it
-        int32_t   request_code; // -1 if plain startActivity
-        DxObject *saved_state;  // Bundle from onSaveInstanceState (NULL if none)
+        DxObject   *activity;     // the Activity object
+        const char *class_name;   // class descriptor of the activity
+        DxObject   *intent;       // Intent that launched it
+        int32_t     request_code; // -1 if plain startActivity
+        DxObject   *saved_state;  // Bundle from onSaveInstanceState (NULL if none)
     } activity_stack[DX_MAX_ACTIVITY_STACK];
     uint32_t activity_stack_depth;
 
@@ -253,6 +304,30 @@ struct DxVM {
         DxValue  value;
     } prefs[DX_MAX_PREFS_ENTRIES];
     uint32_t prefs_count;
+
+    // Incremental GC state
+    enum { DX_GC_IDLE = 0, DX_GC_MARKING, DX_GC_SWEEPING } gc_phase;
+    #define DX_GC_MARK_STACK_SIZE 4096
+    DxObject  *gc_mark_stack[DX_GC_MARK_STACK_SIZE];
+    uint32_t   gc_mark_stack_top;
+    uint32_t   gc_sweep_cursor;       // current position in heap during incremental sweep
+
+    // Singleton ClassLoader object (returned by Class.getClassLoader())
+    DxObject  *singleton_classloader;
+
+    // ── Profiling ──
+    bool       profiling_enabled;
+
+    // Opcode frequency histogram (256 Dalvik opcodes)
+    uint64_t   opcode_histogram[256];
+
+    // GC pause time measurement
+    uint64_t   last_gc_pause_ns;
+    uint64_t   total_gc_pause_ns;
+
+    // Heap allocation profiling
+    uint64_t   total_allocations;
+    uint64_t   total_bytes_allocated;
 };
 
 // VM lifecycle
@@ -265,9 +340,15 @@ DxResult dx_vm_register_framework_classes(DxVM *vm);
 DxResult dx_vm_load_class(DxVM *vm, const char *descriptor, DxClass **out);
 DxResult dx_vm_init_class(DxVM *vm, DxClass *cls);
 DxClass *dx_vm_find_class(DxVM *vm, const char *descriptor);
+void     dx_vm_class_hash_insert(DxVM *vm, DxClass *cls);
+
+// Framework class registration (called by dx_vm_register_framework_classes)
+DxResult dx_register_java_lang(DxVM *vm);
+DxResult dx_register_android_framework(DxVM *vm);
 
 // Garbage collection
 void      dx_vm_gc(DxVM *vm);
+void      dx_vm_gc_step(DxVM *vm);   // incremental GC step (processes up to 256 objects)
 
 // Object operations
 DxObject *dx_vm_alloc_object(DxVM *vm, DxClass *cls);
@@ -332,5 +413,24 @@ sigjmp_buf *dx_crash_get_jmpbuf(void);
 // Debug tracing configuration
 void dx_vm_set_trace(DxVM *vm, bool bytecode, bool class_load, bool method_call);
 void dx_vm_set_trace_filter(DxVM *vm, const char *method_filter);
+
+// Inline cache operations
+DxInlineCache *dx_vm_ic_get(DxMethod *method, uint32_t pc);
+DxMethod      *dx_vm_ic_lookup(DxInlineCache *ic, DxClass *receiver_class);
+void           dx_vm_ic_insert(DxInlineCache *ic, DxClass *receiver_class, DxMethod *resolved);
+void           dx_vm_ic_stats(DxVM *vm);
+
+// Method inlining constants
+#define DX_INLINE_NONE   0
+#define DX_INLINE_GETTER 1
+#define DX_INLINE_SETTER 2
+
+// Analyze a method for trivial getter/setter inlining
+void dx_method_analyze_inline(DxMethod *method);
+
+// Profiling
+void dx_vm_set_profiling(DxVM *vm, bool enabled);
+void dx_vm_dump_opcode_stats(DxVM *vm);
+void dx_vm_dump_hot_methods(DxVM *vm, int top_n);
 
 #endif // DX_VM_H

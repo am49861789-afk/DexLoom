@@ -98,6 +98,25 @@ struct ManifestFeatureInfo {
     let required: Bool
 }
 
+// MARK: - Resource Resolution Models
+
+struct ResourceResolution: Identifiable {
+    let id = UUID()
+    let resourceId: UInt32
+    let type: String           // e.g., "string", "color", "dimen"
+    let qualifiers: String     // config qualifiers description
+    let resolvedValue: String  // formatted resolved value
+    let configUsed: String     // which config matched
+}
+
+struct ResourceEntry: Identifiable {
+    let id = UUID()
+    let resourceId: UInt32
+    let name: String
+    let type: String
+    let value: String
+}
+
 // MARK: - Access Flags Helper
 
 private func accessFlagsString(_ flags: UInt32, isClass: Bool) -> String {
@@ -250,6 +269,16 @@ struct RenderNode: Identifiable {
     let shapeBg: ShapeBackground?  // Shape drawable background
     let webURL: String?           // URL for WebView
     let webHTML: String?          // HTML content for WebView
+    let alpha: Float               // 0.0-1.0 (default 1.0)
+    let rotation: Float            // degrees (default 0)
+    let scaleX: Float              // scale factor (default 1.0)
+    let scaleY: Float              // scale factor (default 1.0)
+    let translationX: Float        // dp offset (default 0)
+    let translationY: Float        // dp offset (default 0)
+    let measuredWidth: Float         // resolved width in dp (0 = not measured)
+    let measuredHeight: Float        // resolved height in dp (0 = not measured)
+    let focusable: Bool              // true if view can receive focus
+    let focused: Bool                // true if view currently has focus
     let drawCommands: [DrawCommand]  // Canvas draw commands
     let children: [RenderNode]
 }
@@ -274,6 +303,11 @@ final class RuntimeBridge: ObservableObject {
     private var logFlushScheduled = false
     private static let maxLogs = 1000
     private var memoryWarningObserver: NSObjectProtocol?
+
+    // Throttle render model refreshes to ~60fps (16ms minimum interval)
+    private var lastRenderRefresh: CFAbsoluteTime = 0
+    private static let minRenderInterval: CFAbsoluteTime = 0.016 // 16ms
+    private var deferredRenderScheduled = false
 
     init() {
         addLog(level: "INFO", tag: "Bridge", message: "DexLoom runtime bridge initialized")
@@ -487,12 +521,10 @@ final class RuntimeBridge: ObservableObject {
                 if result == DX_OK {
                     self.addLog(level: "INFO", tag: "Bridge", message: "Runtime started successfully")
                     // Build initial render tree
-                    if let model = dx_runtime_get_render_model(ctx) {
+                    self.refreshRenderTree(from: ctx, force: true)
+                    if self.renderTree != nil {
                         self.addLog(level: "INFO", tag: "Bridge", message: "Render model found, building tree")
-                        self.renderTree = RuntimeBridge.convertRenderModel(model.pointee.root)
-                        if self.renderTree != nil {
-                            self.addLog(level: "INFO", tag: "Bridge", message: "Render tree built: type=\(self.renderTree!.type.rawValue), children=\(self.renderTree!.children.count)")
-                        }
+                        self.addLog(level: "INFO", tag: "Bridge", message: "Render tree built: type=\(self.renderTree!.type.rawValue), children=\(self.renderTree!.children.count)")
                     } else {
                         self.addLog(level: "WARN", tag: "Bridge", message: "No render model available (setContentView may not have been called)")
                     }
@@ -520,6 +552,33 @@ final class RuntimeBridge: ObservableObject {
         }
     }
 
+    /// Refresh render tree with 60fps throttle. Skips if less than 16ms since last refresh
+    /// unless `force` is true (used for initial build).
+    /// When an update is skipped due to throttle, a deferred update is scheduled 16ms later
+    /// to ensure the final state in a burst of updates is always rendered.
+    private func refreshRenderTree(from ctx: UnsafeMutablePointer<DxContext>, force: Bool = false) {
+        let now = CFAbsoluteTimeGetCurrent()
+        if !force && (now - lastRenderRefresh) < RuntimeBridge.minRenderInterval {
+            // Schedule a deferred render so the final update in a burst is never lost
+            if !deferredRenderScheduled {
+                deferredRenderScheduled = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + RuntimeBridge.minRenderInterval) { [weak self] in
+                    guard let self = self else { return }
+                    self.deferredRenderScheduled = false
+                    if let model = dx_runtime_get_render_model(ctx) {
+                        self.renderTree = RuntimeBridge.convertRenderModel(model.pointee.root)
+                        self.lastRenderRefresh = CFAbsoluteTimeGetCurrent()
+                    }
+                }
+            }
+            return
+        }
+        if let model = dx_runtime_get_render_model(ctx) {
+            self.renderTree = RuntimeBridge.convertRenderModel(model.pointee.root)
+            lastRenderRefresh = now
+        }
+    }
+
     func dispatchClick(viewId: UInt32) {
         guard let ctx = context else { return }
         addLog(level: "DEBUG", tag: "Bridge", message: "Click on view 0x\(String(viewId, radix: 16))")
@@ -533,10 +592,8 @@ final class RuntimeBridge: ObservableObject {
                     let errStr = String(cString: dx_result_string(result))
                     self.addLog(level: "WARN", tag: "Bridge", message: "Click dispatch failed: \(errStr)")
                 }
-                // Refresh render tree
-                if let model = dx_runtime_get_render_model(ctx) {
-                    self.renderTree = RuntimeBridge.convertRenderModel(model.pointee.root)
-                }
+                // Refresh render tree (throttled)
+                self.refreshRenderTree(from: ctx)
             }
         }
     }
@@ -554,10 +611,8 @@ final class RuntimeBridge: ObservableObject {
                     let errStr = String(cString: dx_result_string(result))
                     self.addLog(level: "WARN", tag: "Bridge", message: "Long-click dispatch failed: \(errStr)")
                 }
-                // Refresh render tree
-                if let model = dx_runtime_get_render_model(ctx) {
-                    self.renderTree = RuntimeBridge.convertRenderModel(model.pointee.root)
-                }
+                // Refresh render tree (throttled)
+                self.refreshRenderTree(from: ctx)
             }
         }
     }
@@ -575,10 +630,8 @@ final class RuntimeBridge: ObservableObject {
                     let errStr = String(cString: dx_result_string(result))
                     self.addLog(level: "WARN", tag: "Bridge", message: "Refresh dispatch failed: \(errStr)")
                 }
-                // Refresh render tree
-                if let model = dx_runtime_get_render_model(ctx) {
-                    self.renderTree = RuntimeBridge.convertRenderModel(model.pointee.root)
-                }
+                // Refresh render tree (throttled)
+                self.refreshRenderTree(from: ctx)
             }
         }
     }
@@ -603,10 +656,8 @@ final class RuntimeBridge: ObservableObject {
                     let errStr = String(cString: dx_result_string(result))
                     self.addLog(level: "WARN", tag: "Bridge", message: "Back dispatch failed: \(errStr)")
                 }
-                // Refresh render tree
-                if let model = dx_runtime_get_render_model(ctx) {
-                    self.renderTree = RuntimeBridge.convertRenderModel(model.pointee.root)
-                }
+                // Refresh render tree (throttled)
+                self.refreshRenderTree(from: ctx)
             }
         }
     }
@@ -909,6 +960,160 @@ final class RuntimeBridge: ObservableObject {
         )
     }
 
+    // MARK: - Resource Inspector
+
+    /// Resolve a resource by ID and return resolution metadata
+    func resolveResource(id: UInt32) -> ResourceResolution? {
+        guard let ctx = context, let res = ctx.pointee.resources else { return nil }
+
+        let entry = dx_resources_find_by_id(res, id)
+        guard let e = entry else { return nil }
+
+        let typeName: String
+        if let tn = e.pointee.type_name {
+            typeName = String(cString: tn)
+        } else {
+            typeName = resourceTypeName(for: e.pointee.value_type)
+        }
+
+        let entryName: String
+        if let en = e.pointee.entry_name {
+            entryName = String(cString: en)
+        } else {
+            entryName = String(format: "0x%08X", id)
+        }
+
+        let resolvedValue = formatResourceValue(e.pointee)
+        let qualifiers = formatResConfig(e.pointee.config)
+        let configUsed = qualifiers.isEmpty ? "default" : qualifiers
+
+        return ResourceResolution(
+            resourceId: id,
+            type: typeName,
+            qualifiers: qualifiers.isEmpty ? "default (no qualifiers)" : qualifiers,
+            resolvedValue: "\(entryName) = \(resolvedValue)",
+            configUsed: configUsed
+        )
+    }
+
+    /// Get all resource entries (for the resource list)
+    func getAllResourceEntries() -> [ResourceEntry] {
+        guard let ctx = context, let res = ctx.pointee.resources else { return [] }
+        var result: [ResourceEntry] = []
+
+        let count = Int(res.pointee.entry_count)
+        for i in 0..<count {
+            let e = res.pointee.entries.advanced(by: i).pointee
+            let name: String
+            if let en = e.entry_name {
+                name = String(cString: en)
+            } else {
+                name = String(format: "0x%08X", e.id)
+            }
+            let typeName: String
+            if let tn = e.type_name {
+                typeName = String(cString: tn)
+            } else {
+                typeName = resourceTypeName(for: e.value_type)
+            }
+            let value = formatResourceValue(e)
+
+            result.append(ResourceEntry(
+                resourceId: e.id,
+                name: name,
+                type: typeName,
+                value: value
+            ))
+        }
+
+        return result
+    }
+
+    private func resourceTypeName(for valueType: UInt8) -> String {
+        // Resource value type constants from DxResValueType C enum
+        switch valueType {
+        case 3: return "string"      // DX_RES_TYPE_STRING
+        case 16: return "integer"    // DX_RES_TYPE_INT_DEC
+        case 17: return "integer-hex" // DX_RES_TYPE_INT_HEX
+        case 18: return "bool"       // DX_RES_TYPE_INT_BOOL
+        case 28, 29, 30, 31: return "color" // ARGB8, RGB8, ARGB4, RGB4
+        case 5: return "dimen"       // DX_RES_TYPE_DIMEN
+        case 4: return "float"       // DX_RES_TYPE_FLOAT
+        case 1: return "reference"   // DX_RES_TYPE_REF
+        case 6: return "fraction"    // DX_RES_TYPE_FRACTION
+        default: return "unknown"
+        }
+    }
+
+    private func formatResourceValue(_ e: DxResourceEntry) -> String {
+        // Resource value type constants from DxResValueType C enum
+        switch e.value_type {
+        case 3: // DX_RES_TYPE_STRING
+            if let s = e.str_val {
+                return String(cString: s)
+            }
+            return "(null)"
+        case 16: // DX_RES_TYPE_INT_DEC
+            return "\(e.int_val)"
+        case 17: // DX_RES_TYPE_INT_HEX
+            return String(format: "0x%08X", e.int_val)
+        case 18: // DX_RES_TYPE_INT_BOOL
+            return e.bool_val ? "true" : "false"
+        case 28, 29, 30, 31: // DX_RES_TYPE_INT_COLOR_*
+            return String(format: "#%08X", e.color_val)
+        case 5: // DX_RES_TYPE_DIMEN
+            let unitNames = ["px", "dp", "sp", "pt", "in", "mm"]
+            let unit = Int(e.dimen.unit)
+            let unitStr = unit < unitNames.count ? unitNames[unit] : "?"
+            return String(format: "%.1f%@", e.dimen.value, unitStr)
+        case 4: // DX_RES_TYPE_FLOAT
+            return String(format: "%.4f", e.float_val)
+        case 1: // DX_RES_TYPE_REF
+            return String(format: "@0x%08X", e.ref_id)
+        default:
+            return "(type \(e.value_type))"
+        }
+    }
+
+    private func formatResConfig(_ cfg: DxResConfig) -> String {
+        var parts: [String] = []
+        let lang = withUnsafeBytes(of: cfg.language) { buf -> String in
+            let bytes = Array(buf.prefix(2))
+            if bytes[0] != 0 { return String(bytes: bytes.filter { $0 != 0 }, encoding: .ascii) ?? "" }
+            return ""
+        }
+        if !lang.isEmpty { parts.append(lang) }
+
+        let country = withUnsafeBytes(of: cfg.country) { buf -> String in
+            let bytes = Array(buf.prefix(2))
+            if bytes[0] != 0 { return "r" + (String(bytes: bytes.filter { $0 != 0 }, encoding: .ascii) ?? "") }
+            return ""
+        }
+        if !country.isEmpty { parts.append(country) }
+
+        if cfg.density != 0 {
+            switch cfg.density {
+            case 120: parts.append("ldpi")
+            case 160: parts.append("mdpi")
+            case 240: parts.append("hdpi")
+            case 320: parts.append("xhdpi")
+            case 480: parts.append("xxhdpi")
+            case 640: parts.append("xxxhdpi")
+            default: parts.append("\(cfg.density)dpi")
+            }
+        }
+
+        if cfg.orientation == 1 { parts.append("port") }
+        else if cfg.orientation == 2 { parts.append("land") }
+
+        if cfg.night_mode == 1 { parts.append("notnight") }
+        else if cfg.night_mode == 2 { parts.append("night") }
+
+        if cfg.sdk_version != 0 { parts.append("v\(cfg.sdk_version)") }
+
+        return parts.joined(separator: "-")
+    }
+
     // MARK: - Diagnostics
 
     /// Dump the UI tree hierarchy as a formatted string
@@ -1101,6 +1306,16 @@ final class RuntimeBridge: ObservableObject {
             shapeBg: shapeBg,
             webURL: n.web_url.map { String(cString: $0) },
             webHTML: n.web_html.map { String(cString: $0) },
+            alpha: n.alpha,
+            rotation: n.rotation,
+            scaleX: n.scale_x,
+            scaleY: n.scale_y,
+            translationX: n.translation_x,
+            translationY: n.translation_y,
+            measuredWidth: n.measured_width,
+            measuredHeight: n.measured_height,
+            focusable: n.focusable,
+            focused: n.focused,
             drawCommands: drawCmds,
             children: children
         )

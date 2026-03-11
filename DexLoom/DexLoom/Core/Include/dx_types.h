@@ -71,6 +71,7 @@ typedef enum {
     DX_ACC_FINAL        = 0x0010,
     DX_ACC_SYNCHRONIZED = 0x0020,
     DX_ACC_BRIDGE       = 0x0040,
+    DX_ACC_VOLATILE     = 0x0040,  // Same bit as BRIDGE; VOLATILE for fields, BRIDGE for methods
     DX_ACC_VARARGS      = 0x0080,
     DX_ACC_NATIVE       = 0x0100,
     DX_ACC_INTERFACE    = 0x0200,

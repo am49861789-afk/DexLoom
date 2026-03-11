@@ -288,24 +288,35 @@ static char *decode_res_string(const uint8_t *pool_data, uint32_t pool_size,
                                 uint32_t offset, bool is_utf8) {
     if (offset >= pool_size) return dx_strdup("");
     const uint8_t *p = pool_data + offset;
+    const uint8_t *end = pool_data + pool_size;
 
     if (is_utf8) {
+        if (p + 1 > end) return dx_strdup("");
         uint32_t char_count = *p++;
         if (char_count > 0x7F) {
+            if (p + 1 > end) return dx_strdup("");
             char_count = ((char_count & 0x7F) << 8) | *p++;
         }
+        if (p + 1 > end) return dx_strdup("");
         uint32_t byte_count = *p++;
         if (byte_count > 0x7F) {
+            if (p + 1 > end) return dx_strdup("");
             byte_count = ((byte_count & 0x7F) << 8) | *p++;
         }
+        if (p + byte_count > end) byte_count = (uint32_t)(end - p);
         char *s = (char *)dx_malloc(byte_count + 1);
         if (!s) return NULL;
         memcpy(s, p, byte_count);
         s[byte_count] = '\0';
         return s;
     } else {
+        if (p + 2 > end) return dx_strdup("");
         uint16_t char_count = read_u16(p);
         p += 2;
+        // Clamp to available data
+        if (p + (uint32_t)char_count * 2 > end) {
+            char_count = (uint16_t)((end - p) / 2);
+        }
         char *s = (char *)dx_malloc(char_count + 1);
         if (!s) return NULL;
         for (uint32_t i = 0; i < char_count; i++) {
@@ -328,7 +339,7 @@ static DxResult parse_string_pool(const uint8_t *data, uint32_t size, uint32_t p
     bool is_utf8 = (flags & (1 << 8)) != 0;
 
     // Integer overflow protection on string pool allocation
-    if (string_count > SIZE_MAX / sizeof(char *) - 1) {
+    if (string_count > 2000000) {  // 2M strings max
         DX_ERROR(TAG, "String pool count %u would overflow allocation", string_count);
         return DX_ERR_INVALID_FORMAT;
     }
@@ -338,17 +349,32 @@ static DxResult parse_string_pool(const uint8_t *data, uint32_t size, uint32_t p
     uint32_t offsets_start = pos + 28;
     uint32_t pool_data_start = pos + strings_start;
 
+    // Validate pool_data_start is within bounds
+    if (strings_start < 28 || pool_data_start > size) {
+        DX_ERROR(TAG, "Resource string pool data start out of bounds: %u", strings_start);
+        dx_free(strings);
+        return DX_ERR_INVALID_FORMAT;
+    }
+
+    // Read the chunk size so we can clamp offsets to the chunk boundary
+    uint32_t chunk_size = read_u32(data + pos + 4);
+    uint32_t chunk_end = pos + chunk_size;
+    if (chunk_end > size) chunk_end = size;  // clamp to file boundary
+
     for (uint32_t i = 0; i < string_count; i++) {
         if (offsets_start + i * 4 + 4 > size) break;
         uint32_t str_offset = read_u32(data + offsets_start + i * 4);
-        if (pool_data_start + str_offset < size) {
+        // Validate string offset against chunk boundary (not just file size)
+        if (pool_data_start + str_offset < chunk_end) {
             strings[i] = decode_res_string(
                 data + pool_data_start,
-                size - pool_data_start,
+                chunk_end - pool_data_start,
                 str_offset,
                 is_utf8
             );
         } else {
+            DX_WARN(TAG, "String pool offset %u for index %u exceeds chunk boundary %u, substituting empty",
+                    str_offset, i, chunk_end - pool_data_start);
             strings[i] = dx_strdup("");
         }
     }
@@ -938,6 +964,9 @@ void dx_resources_free(DxResources *res) {
     }
     dx_free(res->plurals);
 
+    // Clear resource cache (no heap allocations in cache, just zero it)
+    memset(&res->cache, 0, sizeof(res->cache));
+
     // Free general entry table
     for (uint32_t i = 0; i < res->entry_count; i++) {
         DxResourceEntry *e = &res->entries[i];
@@ -979,10 +1008,79 @@ const char *dx_resources_get_layout_filename(const DxResources *res, uint32_t id
     return NULL;
 }
 
+// ── Resource cache helpers ──
+
+// Hash a resource ID into a cache slot index
+static uint32_t res_cache_hash(uint32_t id) {
+    // Simple multiplicative hash
+    return (id * 2654435761u) % DX_RES_CACHE_SIZE;
+}
+
+// Look up a resource ID in the cache. Returns the cached entry or NULL.
+static const DxResourceEntry *res_cache_lookup(const DxResCache *cache, uint32_t id) {
+    if (id == 0) return NULL;
+    uint32_t slot = res_cache_hash(id);
+    // Linear probe
+    for (uint32_t i = 0; i < DX_RES_CACHE_SIZE; i++) {
+        uint32_t idx = (slot + i) & (DX_RES_CACHE_SIZE - 1);
+        if (cache->entries[idx].resource_id == id) {
+            return cache->entries[idx].entry;
+        }
+        if (cache->entries[idx].resource_id == 0) {
+            return NULL; // empty slot = not found
+        }
+    }
+    return NULL;
+}
+
+// Insert a resolved entry into the cache. Uses FIFO eviction when full.
+static void res_cache_insert(DxResCache *cache, uint32_t id, const DxResourceEntry *entry) {
+    if (id == 0 || !entry) return;
+
+    // If cache is full, evict the oldest entry (lowest insert_order)
+    if (cache->count >= DX_RES_CACHE_SIZE) {
+        uint32_t oldest_order = UINT32_MAX;
+        uint32_t oldest_slot = 0;
+        for (uint32_t i = 0; i < DX_RES_CACHE_SIZE; i++) {
+            if (cache->entries[i].resource_id != 0 &&
+                cache->entries[i].insert_order < oldest_order) {
+                oldest_order = cache->entries[i].insert_order;
+                oldest_slot = i;
+            }
+        }
+        cache->entries[oldest_slot].resource_id = 0;
+        cache->entries[oldest_slot].entry = NULL;
+        cache->count--;
+    }
+
+    // Find a free slot using linear probing from the hash position
+    uint32_t slot = res_cache_hash(id);
+    for (uint32_t i = 0; i < DX_RES_CACHE_SIZE; i++) {
+        uint32_t idx = (slot + i) & (DX_RES_CACHE_SIZE - 1);
+        if (cache->entries[idx].resource_id == 0 ||
+            cache->entries[idx].resource_id == id) {
+            cache->entries[idx].resource_id = id;
+            cache->entries[idx].entry = entry;
+            cache->entries[idx].insert_order = cache->next_order++;
+            if (cache->entries[idx].resource_id != id) {
+                cache->count++;
+            }
+            return;
+        }
+    }
+}
+
 const DxResourceEntry *dx_resources_find_by_id(const DxResources *res, uint32_t id) {
     if (!res) return NULL;
+
+    // Check cache first
+    const DxResourceEntry *cached = res_cache_lookup(&res->cache, id);
+    if (cached) return cached;
+
     for (uint32_t i = 0; i < res->entry_count; i++) {
         if (res->entries[i].id == id) {
+            // Cache the result (cast away const for cache mutation)
+            res_cache_insert(&((DxResources *)res)->cache, id, &res->entries[i]);
             return &res->entries[i];
         }
     }
@@ -993,7 +1091,16 @@ const DxResourceEntry *dx_resources_find_by_id_q(const DxResources *res, uint32_
                                                    const DxDeviceConfig *dev) {
     if (!res) return NULL;
     if (!dev) return dx_resources_find_by_id(res, id); // fallback to first match
-    return pick_best_entry(res, id, dev);
+
+    // Check cache first (qualifier-aware lookups are the expensive ones)
+    const DxResourceEntry *cached = res_cache_lookup(&res->cache, id);
+    if (cached) return cached;
+
+    const DxResourceEntry *best = pick_best_entry(res, id, dev);
+    if (best) {
+        res_cache_insert(&((DxResources *)res)->cache, id, best);
+    }
+    return best;
 }
 
 const char *dx_resources_find_string(const DxResources *res, uint32_t id,
@@ -1150,7 +1257,20 @@ DxStyleBag *dx_resources_resolve_style(const DxResources *res, uint32_t style_re
     uint32_t depth = 0;
     uint32_t first_parent = 0;
 
+    // Track visited style IDs for circular reference detection
+    uint32_t visited[MAX_STYLE_PARENT_DEPTH];
+    uint32_t visited_count = 0;
+
     while (current_id != 0 && depth < MAX_STYLE_PARENT_DEPTH) {
+        // Check for circular reference
+        for (uint32_t v = 0; v < visited_count; v++) {
+            if (visited[v] == current_id) {
+                DX_WARN(TAG, "Circular style reference detected at 0x%08x", current_id);
+                goto done_chain;
+            }
+        }
+        visited[visited_count++] = current_id;
+
         const DxStyleRecord *rec = find_style_record(res, current_id);
         if (!rec) break;
 
@@ -1181,6 +1301,7 @@ DxStyleBag *dx_resources_resolve_style(const DxResources *res, uint32_t style_re
         current_id = rec->parent_id;
         depth++;
     }
+    done_chain:
 
     if (tmp_count == 0) {
         dx_free(tmp);

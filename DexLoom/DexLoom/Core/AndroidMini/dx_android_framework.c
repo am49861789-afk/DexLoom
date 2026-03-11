@@ -8,6 +8,13 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <errno.h>
+#include "../Include/dx_runtime.h"
 
 #define TAG "Android"
 
@@ -17,7 +24,6 @@
 static void rebuild_render_model(DxVM *vm);
 static DxObject *create_file_object(DxVM *vm, const char *path);
 static DxObject *call_on_save_instance_state(DxVM *vm, DxObject *activity);
-extern DxResult dx_register_java_lang(DxVM *vm);
 
 // Reflection native method forward declarations
 static DxResult native_class_forName(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
@@ -430,6 +436,17 @@ static DxResult native_view_find_view_by_id(DxVM *vm, DxFrame *frame,
         frame->result = DX_NULL_VALUE;
     }
     frame->has_result = true;
+    return DX_OK;
+}
+
+static DxResult native_view_invalidate(DxVM *vm, DxFrame *frame,
+                                        DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)frame; (void)arg_count;
+    DxObject *self = args[0].obj;
+    if (self && self->ui_node) {
+        dx_ui_node_invalidate(self->ui_node);
+        DX_DEBUG(TAG, "View invalidated: id=0x%x", self->ui_node->view_id);
+    }
     return DX_OK;
 }
 
@@ -2470,6 +2487,8 @@ static DxResult start_activity_internal(DxVM *vm, DxObject *caller, DxObject *in
         DxObject *saved = call_on_save_instance_state(vm, prev_activity);
 
         vm->activity_stack[vm->activity_stack_depth].activity     = prev_activity;
+        vm->activity_stack[vm->activity_stack_depth].class_name   =
+            prev_activity->klass ? prev_activity->klass->descriptor : "?";
         vm->activity_stack[vm->activity_stack_depth].intent       = intent;
         vm->activity_stack[vm->activity_stack_depth].request_code = request_code;
         vm->activity_stack[vm->activity_stack_depth].saved_state  = saved;
@@ -2752,6 +2771,15 @@ static DxResult native_activity_finish(DxVM *vm, DxFrame *frame, DxValue *args, 
 
     rebuild_render_model(vm);
     return DX_OK;
+}
+
+// ============================================================
+// Activity.onBackPressed() -- behaves like finish()
+// ============================================================
+static DxResult native_activity_on_back_pressed(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)frame;
+    DX_INFO(TAG, "onBackPressed: delegating to finish()");
+    return native_activity_finish(vm, frame, args, arg_count);
 }
 
 // ============================================================
@@ -8136,9 +8164,6 @@ static void add_method(DxClass *cls, const char *name, const char *shorty,
     *count = new_count;
 }
 
-// Forward declaration for hash table insert (defined in dx_vm.c)
-extern void dx_vm_class_hash_insert(DxVM *vm, DxClass *cls);
-
 static DxClass *reg_class(DxVM *vm, const char *desc, DxClass *super) {
     if (vm->class_count >= DX_MAX_CLASSES) return NULL;
     DxClass *cls = (DxClass *)dx_malloc(sizeof(DxClass));
@@ -9296,21 +9321,104 @@ static DxResult native_context_get_app_info(DxVM *vm, DxFrame *frame, DxValue *a
 }
 
 // ============================================================
+// ClassLoader.loadClass(String name) — delegate to dx_vm_find_class
+// ============================================================
+static DxResult native_classloader_load_class(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    // args[0] = this (ClassLoader), args[1] = String class name
+    const char *name = NULL;
+    if (arg_count > 1 && args[1].tag == DX_VAL_OBJ && args[1].obj) {
+        name = dx_vm_get_string_value(args[1].obj);
+    }
+    if (name) {
+        // Convert dotted name (e.g., "com.example.Foo") to descriptor ("Lcom/example/Foo;")
+        size_t len = strlen(name);
+        char *desc = (char *)dx_malloc(len + 3); // L + name + ; + \0
+        if (desc) {
+            desc[0] = 'L';
+            for (size_t i = 0; i < len; i++) {
+                desc[i + 1] = (name[i] == '.') ? '/' : name[i];
+            }
+            desc[len + 1] = ';';
+            desc[len + 2] = '\0';
+
+            DxClass *cls = dx_vm_find_class(vm, desc);
+            dx_free(desc);
+
+            if (cls) {
+                // Return a Class object wrapping this DxClass
+                DxClass *class_cls = dx_vm_find_class(vm, "Ljava/lang/Class;");
+                if (class_cls) {
+                    DxObject *class_obj = dx_vm_alloc_object(vm, class_cls);
+                    if (class_obj) {
+                        class_obj->fields[0] = (DxValue){.tag = DX_VAL_INT, .i = (int32_t)(uintptr_t)cls};
+                        frame->result = DX_OBJ_VALUE(class_obj);
+                        frame->has_result = true;
+                        return DX_OK;
+                    }
+                }
+            }
+        }
+    }
+    // Class not found: return null (apps typically catch ClassNotFoundException)
+    frame->result = DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
+// ClassLoader.getParent() — return parent ClassLoader from field[0]
+// ============================================================
+static DxResult native_classloader_get_parent(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)arg_count;
+    // field[0] stores the parent ClassLoader (or null)
+    if (arg_count > 0 && args[0].tag == DX_VAL_OBJ && args[0].obj &&
+        args[0].obj->fields && args[0].obj->klass &&
+        args[0].obj->klass->instance_field_count > 0 &&
+        args[0].obj->fields[0].tag == DX_VAL_OBJ) {
+        frame->result = args[0].obj->fields[0];
+    } else {
+        frame->result = DX_NULL_VALUE;
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
+// Class.getClassLoader() — return singleton ClassLoader object
+// ============================================================
+static DxResult native_class_get_class_loader(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)args; (void)arg_count;
+    // Return the singleton PathClassLoader
+    if (vm->singleton_classloader) {
+        frame->result = DX_OBJ_VALUE(vm->singleton_classloader);
+    } else {
+        // Lazily create one
+        DxClass *pcl_cls = dx_vm_find_class(vm, "Ldalvik/system/PathClassLoader;");
+        if (!pcl_cls) pcl_cls = dx_vm_find_class(vm, "Ljava/lang/ClassLoader;");
+        if (pcl_cls) {
+            DxObject *cl = dx_vm_alloc_object(vm, pcl_cls);
+            if (cl) {
+                vm->singleton_classloader = cl;
+                frame->result = DX_OBJ_VALUE(cl);
+            } else {
+                frame->result = DX_NULL_VALUE;
+            }
+        } else {
+            frame->result = DX_NULL_VALUE;
+        }
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
 // Context.getClassLoader() — return a stub ClassLoader object
 // ============================================================
 static DxResult native_context_get_class_loader(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
     (void)args; (void)arg_count;
-    DxClass *cl_cls = dx_vm_find_class(vm, "Ljava/lang/ClassLoader;");
-    if (cl_cls) {
-        DxObject *cl = dx_vm_alloc_object(vm, cl_cls);
-        frame->result = cl ? DX_OBJ_VALUE(cl) : DX_NULL_VALUE;
-    } else {
-        // Fallback: return a generic object
-        DxObject *cl = dx_vm_alloc_object(vm, vm->class_object);
-        frame->result = cl ? DX_OBJ_VALUE(cl) : DX_NULL_VALUE;
-    }
-    frame->has_result = true;
-    return DX_OK;
+    // Delegate to the singleton ClassLoader
+    return native_class_get_class_loader(vm, frame, args, arg_count);
 }
 
 // ============================================================
@@ -11266,6 +11374,409 @@ static DxResult native_retrofit_response_error(DxVM *vm, DxFrame *frame, DxValue
     return DX_OK;
 }
 
+// ============================================================
+// java.net.Socket — POSIX TCP socket support
+// ============================================================
+// Socket field layout:
+//   field[0].i = socket fd (or -1 if invalid)
+//   field[1].i = connected flag (0/1)
+//   field[2].i = closed flag (0/1)
+
+// Socket(String host, int port)
+static DxResult native_socket_init(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)frame;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (!self || !self->fields || !self->klass || self->klass->instance_field_count < 3) {
+        return DX_OK;
+    }
+
+    // Default to invalid state
+    self->fields[0] = DX_INT_VALUE(-1);
+    self->fields[1] = DX_INT_VALUE(0);
+    self->fields[2] = DX_INT_VALUE(0);
+
+    if (arg_count < 3) return DX_OK;
+
+    const char *host = NULL;
+    if (args[1].tag == DX_VAL_OBJ && args[1].obj) {
+        host = dx_vm_get_string_value(args[1].obj);
+    }
+    int port = (args[2].tag == DX_VAL_INT) ? args[2].i : 0;
+
+    if (!host || port <= 0 || port > 65535) {
+        DX_WARN("Socket", "Invalid host/port: %s:%d", host ? host : "null", port);
+        return DX_OK;
+    }
+
+    DX_INFO("Socket", "Connecting to %s:%d", host, port);
+
+    // Resolve host
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    int gai = getaddrinfo(host, port_str, &hints, &res);
+    if (gai != 0 || !res) {
+        DX_WARN("Socket", "DNS resolution failed for %s: %s", host, gai_strerror(gai));
+        if (res) freeaddrinfo(res);
+        return DX_OK;
+    }
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) {
+        DX_WARN("Socket", "socket() failed: %s", strerror(errno));
+        freeaddrinfo(res);
+        return DX_OK;
+    }
+
+    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+        DX_WARN("Socket", "connect() failed: %s", strerror(errno));
+        close(fd);
+        freeaddrinfo(res);
+        return DX_OK;
+    }
+
+    freeaddrinfo(res);
+
+    DX_INFO("Socket", "Connected to %s:%d (fd=%d)", host, port, fd);
+    self->fields[0] = DX_INT_VALUE(fd);
+    self->fields[1] = DX_INT_VALUE(1); // connected
+    self->fields[2] = DX_INT_VALUE(0); // not closed
+    return DX_OK;
+}
+
+// Socket.close()
+static DxResult native_socket_close(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)frame;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (!self || !self->fields || !self->klass || self->klass->instance_field_count < 3) return DX_OK;
+
+    int fd = self->fields[0].i;
+    if (fd >= 0) {
+        close(fd);
+        DX_DEBUG("Socket", "Closed fd=%d", fd);
+    }
+    self->fields[0] = DX_INT_VALUE(-1);
+    self->fields[1] = DX_INT_VALUE(0);
+    self->fields[2] = DX_INT_VALUE(1); // closed
+    return DX_OK;
+}
+
+// Socket.isConnected()
+static DxResult native_socket_is_connected(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    int connected = 0;
+    if (self && self->fields && self->klass && self->klass->instance_field_count >= 2) {
+        connected = self->fields[1].i;
+    }
+    frame->result = DX_INT_VALUE(connected);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Socket.isClosed()
+static DxResult native_socket_is_closed(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    int closed = 1;
+    if (self && self->fields && self->klass && self->klass->instance_field_count >= 3) {
+        closed = self->fields[2].i;
+    }
+    frame->result = DX_INT_VALUE(closed);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Socket.getInputStream() -> SocketInputStream (stores socket obj in field[0])
+static DxResult native_socket_get_input_stream(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxClass *sis_cls = dx_vm_find_class(vm, "Ljava/net/SocketInputStream;");
+    if (!sis_cls || !self) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+    DxObject *sis = dx_vm_alloc_object(vm, sis_cls);
+    if (sis && sis->fields && sis->klass && sis->klass->instance_field_count >= 1) {
+        sis->fields[0] = DX_OBJ_VALUE(self); // reference to the socket
+    }
+    frame->result = sis ? DX_OBJ_VALUE(sis) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Socket.getOutputStream() -> SocketOutputStream (stores socket obj in field[0])
+static DxResult native_socket_get_output_stream(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxClass *sos_cls = dx_vm_find_class(vm, "Ljava/net/SocketOutputStream;");
+    if (!sos_cls || !self) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+    DxObject *sos = dx_vm_alloc_object(vm, sos_cls);
+    if (sos && sos->fields && sos->klass && sos->klass->instance_field_count >= 1) {
+        sos->fields[0] = DX_OBJ_VALUE(self); // reference to the socket
+    }
+    frame->result = sos ? DX_OBJ_VALUE(sos) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// SocketInputStream.read(byte[] b) -> int (bytes read, or -1 on EOF/error)
+static DxResult native_socket_input_read(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    // args[0] = this (SocketInputStream), args[1] = byte[] buffer
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxObject *buf = (arg_count > 1 && args[1].tag == DX_VAL_OBJ) ? args[1].obj : NULL;
+
+    if (!self || !self->fields || !self->klass || self->klass->instance_field_count < 1) {
+        frame->result = DX_INT_VALUE(-1);
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // Get the Socket object from field[0]
+    DxObject *sock = (self->fields[0].tag == DX_VAL_OBJ) ? self->fields[0].obj : NULL;
+    if (!sock || !sock->fields || !sock->klass || sock->klass->instance_field_count < 1) {
+        frame->result = DX_INT_VALUE(-1);
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    int fd = sock->fields[0].i;
+    if (fd < 0) {
+        frame->result = DX_INT_VALUE(-1);
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    if (!buf || !buf->is_array || buf->array_length == 0 || !buf->array_elements) {
+        frame->result = DX_INT_VALUE(-1);
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // Read into a temp buffer, then copy to the DxValue array
+    uint32_t len = buf->array_length;
+    if (len > 65536) len = 65536; // cap per-read
+    uint8_t *tmp = (uint8_t *)malloc(len);
+    if (!tmp) {
+        frame->result = DX_INT_VALUE(-1);
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    ssize_t n = read(fd, tmp, len);
+    if (n <= 0) {
+        free(tmp);
+        frame->result = DX_INT_VALUE(-1);
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    for (ssize_t i = 0; i < n; i++) {
+        buf->array_elements[i] = DX_INT_VALUE((int32_t)(tmp[i] & 0xFF));
+    }
+    free(tmp);
+
+    DX_DEBUG("Socket", "read %zd bytes from fd=%d", n, fd);
+    frame->result = DX_INT_VALUE((int32_t)n);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// SocketOutputStream.write(byte[] b) -> void
+static DxResult native_socket_output_write(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)frame;
+    // args[0] = this (SocketOutputStream), args[1] = byte[] buffer
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxObject *buf = (arg_count > 1 && args[1].tag == DX_VAL_OBJ) ? args[1].obj : NULL;
+
+    if (!self || !self->fields || !self->klass || self->klass->instance_field_count < 1) return DX_OK;
+
+    DxObject *sock = (self->fields[0].tag == DX_VAL_OBJ) ? self->fields[0].obj : NULL;
+    if (!sock || !sock->fields || !sock->klass || sock->klass->instance_field_count < 1) return DX_OK;
+
+    int fd = sock->fields[0].i;
+    if (fd < 0) return DX_OK;
+
+    if (!buf || !buf->is_array || buf->array_length == 0 || !buf->array_elements) return DX_OK;
+
+    uint32_t len = buf->array_length;
+    if (len > 65536) len = 65536;
+    uint8_t *tmp = (uint8_t *)malloc(len);
+    if (!tmp) return DX_OK;
+
+    for (uint32_t i = 0; i < len; i++) {
+        tmp[i] = (uint8_t)(buf->array_elements[i].i & 0xFF);
+    }
+
+    ssize_t n = write(fd, tmp, len);
+    free(tmp);
+
+    DX_DEBUG("Socket", "wrote %zd bytes to fd=%d", n, fd);
+    return DX_OK;
+}
+
+// ============================================================
+// java.net.ServerSocket — POSIX TCP server socket support
+// ============================================================
+// ServerSocket field layout:
+//   field[0].i = server socket fd (or -1)
+//   field[1].i = closed flag (0/1)
+
+// ServerSocket(int port)
+static DxResult native_server_socket_init(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)frame;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (!self || !self->fields || !self->klass || self->klass->instance_field_count < 2) return DX_OK;
+
+    self->fields[0] = DX_INT_VALUE(-1);
+    self->fields[1] = DX_INT_VALUE(0);
+
+    int port = (arg_count > 1 && args[1].tag == DX_VAL_INT) ? args[1].i : 0;
+    if (port <= 0 || port > 65535) {
+        DX_WARN("ServerSocket", "Invalid port: %d", port);
+        return DX_OK;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        DX_WARN("ServerSocket", "socket() failed: %s", strerror(errno));
+        return DX_OK;
+    }
+
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)port);
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        DX_WARN("ServerSocket", "bind() failed on port %d: %s", port, strerror(errno));
+        close(fd);
+        return DX_OK;
+    }
+
+    if (listen(fd, 16) < 0) {
+        DX_WARN("ServerSocket", "listen() failed: %s", strerror(errno));
+        close(fd);
+        return DX_OK;
+    }
+
+    DX_INFO("ServerSocket", "Listening on port %d (fd=%d)", port, fd);
+    self->fields[0] = DX_INT_VALUE(fd);
+    self->fields[1] = DX_INT_VALUE(0);
+    return DX_OK;
+}
+
+// ServerSocket.accept() -> Socket
+static DxResult native_server_socket_accept(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (!self || !self->fields || !self->klass || self->klass->instance_field_count < 1) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    int server_fd = self->fields[0].i;
+    if (server_fd < 0) {
+        DX_WARN("ServerSocket", "accept() on invalid fd");
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
+    if (client_fd < 0) {
+        DX_WARN("ServerSocket", "accept() failed: %s", strerror(errno));
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    DX_INFO("ServerSocket", "Accepted client (fd=%d)", client_fd);
+
+    // Create a new Socket wrapping the client fd
+    DxClass *sock_cls = dx_vm_find_class(vm, "Ljava/net/Socket;");
+    if (!sock_cls) {
+        close(client_fd);
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    DxObject *client_sock = dx_vm_alloc_object(vm, sock_cls);
+    if (client_sock && client_sock->fields && client_sock->klass
+        && client_sock->klass->instance_field_count >= 3) {
+        client_sock->fields[0] = DX_INT_VALUE(client_fd);
+        client_sock->fields[1] = DX_INT_VALUE(1); // connected
+        client_sock->fields[2] = DX_INT_VALUE(0); // not closed
+    } else {
+        close(client_fd);
+    }
+
+    frame->result = client_sock ? DX_OBJ_VALUE(client_sock) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ServerSocket.close()
+static DxResult native_server_socket_close(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)frame;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (!self || !self->fields || !self->klass || self->klass->instance_field_count < 2) return DX_OK;
+
+    int fd = self->fields[0].i;
+    if (fd >= 0) {
+        close(fd);
+        DX_DEBUG("ServerSocket", "Closed fd=%d", fd);
+    }
+    self->fields[0] = DX_INT_VALUE(-1);
+    self->fields[1] = DX_INT_VALUE(1); // closed
+    return DX_OK;
+}
+
+// ============================================================
+// File sandboxing wrappers for java.io.File
+// ============================================================
+
+// Sandboxed File.<init>(String) — rejects disallowed paths
+static DxResult native_file_init_string_sandboxed(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)frame;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (!self) return DX_OK;
+
+    if (arg_count > 1 && args[1].tag == DX_VAL_OBJ && args[1].obj) {
+        const char *path = dx_vm_get_string_value(args[1].obj);
+        if (path && !dx_runtime_check_file_path(path)) {
+            DX_WARN("File", "Sandbox blocked path: %s", path);
+            // Store empty path instead
+            DxObject *empty = dx_vm_create_string(vm, "");
+            if (self->fields && self->klass && self->klass->instance_field_count > 0 && empty) {
+                self->fields[0] = DX_OBJ_VALUE(empty);
+            }
+            return DX_OK;
+        }
+        DX_DEBUG("File", "<init>(\"%s\")", path ? path : "null");
+        if (self->fields && self->klass && self->klass->instance_field_count > 0) {
+            self->fields[0] = args[1];
+        }
+    }
+    return DX_OK;
+}
+
 DxResult dx_register_android_framework(DxVM *vm) {
     if (!vm) return DX_ERR_NULL_PTR;
 
@@ -11433,9 +11944,9 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(view_cls, "getTag", "L", DX_ACC_PUBLIC,
                native_return_null, false);
     add_method(view_cls, "invalidate", "V", DX_ACC_PUBLIC,
-               native_noop, false);
+               native_view_invalidate, false);
     add_method(view_cls, "requestLayout", "V", DX_ACC_PUBLIC,
-               native_noop, false);
+               native_view_invalidate, false);
 
     // android.widget.TextView (extends View)
     DxClass *textview_cls = reg_class(vm, "Landroid/widget/TextView;", view_cls);
@@ -13882,6 +14393,8 @@ DxResult dx_register_android_framework(DxVM *vm) {
                native_noop, false);
     add_method(activity_cls, "onCreateContextMenu", "VLLL", DX_ACC_PUBLIC,
                native_noop, false);
+    add_method(activity_cls, "onBackPressed", "V", DX_ACC_PUBLIC,
+               native_activity_on_back_pressed, false);
 
     // String: contentEquals, format
     DxClass *str_cls_fw = dx_vm_find_class(vm, "Ljava/lang/String;");
@@ -13921,6 +14434,8 @@ DxResult dx_register_android_framework(DxVM *vm) {
         class_cls_fw->instance_field_count = 1;  // field[0] = DxClass* (as int)
         add_method(class_cls_fw, "forName", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC,
                    native_class_forName, true);
+        add_method(class_cls_fw, "forName", "LLZL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+                   native_class_forName, true);  // 3-arg variant with initialize flag
         add_method(class_cls_fw, "getDeclaredField", "LL", DX_ACC_PUBLIC,
                    native_class_get_declared_field, false);
         add_method(class_cls_fw, "getDeclaredMethod", "LLL", DX_ACC_PUBLIC,
@@ -13942,6 +14457,8 @@ DxResult dx_register_android_framework(DxVM *vm) {
                    native_class_get_annotations_fw, false);
         add_method(class_cls_fw, "isAnnotationPresent", "ZL", DX_ACC_PUBLIC,
                    native_class_is_annotation_present_fw, false);
+        add_method(class_cls_fw, "getClassLoader", "L", DX_ACC_PUBLIC,
+                   native_class_get_class_loader, false);
     }
 
     // List interface methods (commonly called via interface invoke)
@@ -16013,7 +16530,7 @@ DxResult dx_register_android_framework(DxVM *vm) {
     DxClass *file_cls = reg_class(vm, "Ljava/io/File;", obj);
     file_cls->instance_field_count = 1; // field[0] = path string
     add_method(file_cls, "<init>", "VL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
-               native_file_init_string, true);
+               native_file_init_string_sandboxed, true);
     add_method(file_cls, "<init>", "VLL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
                native_file_init_parent_child, true);
     add_method(file_cls, "exists", "Z", DX_ACC_PUBLIC,
@@ -16223,6 +16740,44 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(jnet_uri_cls, "getScheme", "L", DX_ACC_PUBLIC, native_return_null, false);
     add_method(jnet_uri_cls, "getHost", "L", DX_ACC_PUBLIC, native_return_null, false);
     add_method(jnet_uri_cls, "getPath", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    // --- java.net.Socket (real TCP) ---
+    DxClass *socket_cls = reg_class(vm, "Ljava/net/Socket;", obj);
+    socket_cls->instance_field_count = 3; // [0]=fd, [1]=connected, [2]=closed
+    add_method(socket_cls, "<init>", "VLI", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_socket_init, true);
+    add_method(socket_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(socket_cls, "getInputStream", "L", DX_ACC_PUBLIC,
+               native_socket_get_input_stream, false);
+    add_method(socket_cls, "getOutputStream", "L", DX_ACC_PUBLIC,
+               native_socket_get_output_stream, false);
+    add_method(socket_cls, "close", "V", DX_ACC_PUBLIC, native_socket_close, false);
+    add_method(socket_cls, "isConnected", "Z", DX_ACC_PUBLIC, native_socket_is_connected, false);
+    add_method(socket_cls, "isClosed", "Z", DX_ACC_PUBLIC, native_socket_is_closed, false);
+
+    // java.net.SocketInputStream (internal — reads from socket fd)
+    DxClass *sock_is_cls = reg_class(vm, "Ljava/net/SocketInputStream;", inputstream_cls);
+    sock_is_cls->instance_field_count = 1; // [0] = reference to Socket object
+    add_method(sock_is_cls, "read", "IL", DX_ACC_PUBLIC, native_socket_input_read, false);
+    add_method(sock_is_cls, "close", "V", DX_ACC_PUBLIC, native_noop, false);
+
+    // java.net.SocketOutputStream (internal — writes to socket fd)
+    DxClass *sock_os_cls = reg_class(vm, "Ljava/net/SocketOutputStream;", outputstream_cls);
+    sock_os_cls->instance_field_count = 1; // [0] = reference to Socket object
+    add_method(sock_os_cls, "write", "VL", DX_ACC_PUBLIC, native_socket_output_write, false);
+    add_method(sock_os_cls, "flush", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(sock_os_cls, "close", "V", DX_ACC_PUBLIC, native_noop, false);
+
+    // --- java.net.ServerSocket (real TCP server) ---
+    DxClass *server_socket_cls = reg_class(vm, "Ljava/net/ServerSocket;", obj);
+    server_socket_cls->instance_field_count = 2; // [0]=fd, [1]=closed
+    add_method(server_socket_cls, "<init>", "VI", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_server_socket_init, true);
+    add_method(server_socket_cls, "accept", "L", DX_ACC_PUBLIC,
+               native_server_socket_accept, false);
+    add_method(server_socket_cls, "close", "V", DX_ACC_PUBLIC,
+               native_server_socket_close, false);
 
     // --- java.util.* (additional) ---
     DxClass *set_cls = reg_class(vm, "Ljava/util/Set;", obj);
@@ -16762,14 +17317,55 @@ DxResult dx_register_android_framework(DxVM *vm) {
 
     // --- java.lang.ClassLoader ---
     DxClass *classloader_cls = reg_class(vm, "Ljava/lang/ClassLoader;", obj);
+    classloader_cls->instance_field_count = 1; // field[0] = parent ClassLoader
+    add_method(classloader_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(classloader_cls, "<init>", "VL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false); // ClassLoader(ClassLoader parent)
     add_method(classloader_cls, "loadClass", "LL", DX_ACC_PUBLIC,
-               native_return_null, false);
+               native_classloader_load_class, false);
     add_method(classloader_cls, "getParent", "L", DX_ACC_PUBLIC,
-               native_return_null, false);
+               native_classloader_get_parent, false);
     add_method(classloader_cls, "getResource", "LL", DX_ACC_PUBLIC,
                native_return_null, false);
     add_method(classloader_cls, "getResourceAsStream", "LL", DX_ACC_PUBLIC,
                native_return_null, false);
+    add_method(classloader_cls, "getSystemClassLoader", "L", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_class_get_class_loader, true);
+
+    // --- dalvik.system.PathClassLoader ---
+    DxClass *path_cl_cls = reg_class(vm, "Ldalvik/system/PathClassLoader;", classloader_cls);
+    path_cl_cls->instance_field_count = 1; // field[0] = parent ClassLoader
+    add_method(path_cl_cls, "<init>", "VLL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false); // PathClassLoader(String dexPath, ClassLoader parent)
+    add_method(path_cl_cls, "<init>", "VLLL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false); // PathClassLoader(String dexPath, String libPath, ClassLoader parent)
+    add_method(path_cl_cls, "loadClass", "LL", DX_ACC_PUBLIC,
+               native_classloader_load_class, false);
+    add_method(path_cl_cls, "getParent", "L", DX_ACC_PUBLIC,
+               native_classloader_get_parent, false);
+
+    // --- dalvik.system.DexClassLoader ---
+    DxClass *dex_cl_cls = reg_class(vm, "Ldalvik/system/DexClassLoader;", classloader_cls);
+    dex_cl_cls->instance_field_count = 1; // field[0] = parent ClassLoader
+    add_method(dex_cl_cls, "<init>", "VLLLL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false); // DexClassLoader(String dexPath, String optDir, String libPath, ClassLoader parent)
+    add_method(dex_cl_cls, "loadClass", "LL", DX_ACC_PUBLIC,
+               native_classloader_load_class, false);
+    add_method(dex_cl_cls, "getParent", "L", DX_ACC_PUBLIC,
+               native_classloader_get_parent, false);
+
+    // --- java.net.URLClassLoader ---
+    DxClass *url_cl_cls = reg_class(vm, "Ljava/net/URLClassLoader;", classloader_cls);
+    url_cl_cls->instance_field_count = 1; // field[0] = parent ClassLoader
+    add_method(url_cl_cls, "<init>", "VL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false); // URLClassLoader(URL[] urls)
+    add_method(url_cl_cls, "<init>", "VLL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false); // URLClassLoader(URL[] urls, ClassLoader parent)
+    add_method(url_cl_cls, "loadClass", "LL", DX_ACC_PUBLIC,
+               native_classloader_load_class, false);
+    add_method(url_cl_cls, "getParent", "L", DX_ACC_PUBLIC,
+               native_classloader_get_parent, false);
 
     // --- java.lang.* (additional) ---
     DxClass *thread_cls = reg_class(vm, "Ljava/lang/Thread;", obj);
@@ -18963,6 +19559,8 @@ static void build_framework_vtables(DxVM *vm) {
 
 static DxResult native_class_forName(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
     // args[0] is string with class name like "com.example.MyClass"
+    // 1-arg: forName(String) — defaults to initialize=true
+    // 3-arg: forName(String, boolean initialize, ClassLoader) — respects initialize flag
     if (arg_count < 1 || args[0].tag != DX_VAL_OBJ || !args[0].obj) {
         frame->result = DX_NULL_VALUE;
         frame->has_result = true;
@@ -18970,6 +19568,12 @@ static DxResult native_class_forName(DxVM *vm, DxFrame *frame, DxValue *args, ui
     }
     const char *name = dx_vm_get_string_value(args[0].obj);
     if (!name) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
+
+    // Determine initialize flag: 1-arg defaults to true, 3-arg reads args[1]
+    bool initialize = true;
+    if (arg_count >= 3) {
+        initialize = (args[1].tag == DX_VAL_INT) ? (args[1].i != 0) : true;
+    }
 
     // Convert "com.example.Foo" to "Lcom/example/Foo;"
     size_t len = strlen(name);
@@ -18984,6 +19588,11 @@ static DxResult native_class_forName(DxVM *vm, DxFrame *frame, DxValue *args, ui
     dx_free(desc);
 
     if (cls) {
+        // Run <clinit> if initialize=true and class not yet initialized
+        if (initialize && cls->status < DX_CLASS_INITIALIZED) {
+            dx_vm_init_class(vm, cls);
+        }
+
         // Return a Class object wrapping this class
         DxClass *class_cls = dx_vm_find_class(vm, "Ljava/lang/Class;");
         DxObject *class_obj = class_cls ? dx_vm_alloc_object(vm, class_cls) : NULL;

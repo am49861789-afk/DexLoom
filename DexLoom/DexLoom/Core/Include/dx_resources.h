@@ -136,6 +136,21 @@ typedef struct {
     char *other;
 } DxPluralResource;
 
+// Resource cache entry (for resolved resource lookups)
+#define DX_RES_CACHE_SIZE 512
+
+typedef struct {
+    uint32_t resource_id;       // resource ID (0 = empty slot)
+    const DxResourceEntry *entry; // cached resolved entry
+    uint32_t insert_order;      // monotonic counter for FIFO eviction
+} DxResCacheEntry;
+
+typedef struct {
+    DxResCacheEntry entries[DX_RES_CACHE_SIZE];
+    uint32_t count;             // number of occupied slots
+    uint32_t next_order;        // monotonic counter for FIFO
+} DxResCache;
+
 // Parsed resources.arsc data
 typedef struct {
     // String pool from resources
@@ -176,6 +191,9 @@ typedef struct {
     DxPluralResource *plurals;
     uint32_t plural_count;
     uint32_t plural_capacity;
+
+    // Resource resolution cache (FIFO eviction, max DX_RES_CACHE_SIZE entries)
+    DxResCache cache;
 } DxResources;
 
 DxResult dx_resources_parse(const uint8_t *data, uint32_t size, DxResources **out);

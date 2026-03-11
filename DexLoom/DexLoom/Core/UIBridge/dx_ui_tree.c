@@ -13,6 +13,137 @@
 #include "../Include/dx_memory.h"
 
 // ============================================================
+// Layout parse cache (FIFO, 32 entries)
+// ============================================================
+
+#define DX_LAYOUT_CACHE_SIZE 32
+
+typedef struct {
+    uint32_t  resource_id;
+    DxUINode *tree;       // cached parsed tree (owned)
+} DxLayoutCacheEntry;
+
+static DxLayoutCacheEntry s_layout_cache[DX_LAYOUT_CACHE_SIZE];
+static uint32_t s_layout_cache_count = 0;
+static uint32_t s_layout_cache_next  = 0;  // FIFO write index
+
+// Deep-clone a DxUINode tree (no listener/runtime_obj references are copied)
+static DxUINode *dx_ui_node_clone(const DxUINode *src) {
+    if (!src) return NULL;
+
+    DxUINode *dst = (DxUINode *)dx_malloc(sizeof(DxUINode));
+    if (!dst) return NULL;
+
+    // Copy all scalar/struct fields
+    memcpy(dst, src, sizeof(DxUINode));
+
+    // Null out pointers that must be independently owned or not cloned
+    dst->parent = NULL;
+    dst->children = NULL;
+    dst->child_count = 0;
+    dst->child_capacity = 0;
+    dst->click_listener = NULL;
+    dst->long_click_listener = NULL;
+    dst->touch_listener = NULL;
+    dst->refresh_listener = NULL;
+    dst->runtime_obj = NULL;
+    dst->draw_commands = NULL;
+    dst->draw_cmd_count = 0;
+    dst->draw_cmd_capacity = 0;
+
+    // Deep-copy owned strings
+    dst->text = src->text ? dx_strdup(src->text) : NULL;
+    dst->hint = src->hint ? dx_strdup(src->hint) : NULL;
+    dst->web_url = src->web_url ? dx_strdup(src->web_url) : NULL;
+    dst->web_html = src->web_html ? dx_strdup(src->web_html) : NULL;
+    dst->vector_path_data = src->vector_path_data ? dx_strdup(src->vector_path_data) : NULL;
+
+    // Deep-copy image data
+    if (src->image_data && src->image_data_len > 0) {
+        dst->image_data = (uint8_t *)dx_malloc(src->image_data_len);
+        if (dst->image_data) {
+            memcpy(dst->image_data, src->image_data, src->image_data_len);
+        }
+        dst->image_data_len = src->image_data_len;
+    } else {
+        dst->image_data = NULL;
+        dst->image_data_len = 0;
+    }
+
+    // Recursively clone children
+    if (src->child_count > 0) {
+        dst->children = (DxUINode **)dx_malloc(sizeof(DxUINode *) * src->child_count);
+        if (dst->children) {
+            dst->child_capacity = src->child_count;
+            for (uint32_t i = 0; i < src->child_count; i++) {
+                DxUINode *child_clone = dx_ui_node_clone(src->children[i]);
+                if (child_clone) {
+                    child_clone->parent = dst;
+                    dst->children[dst->child_count++] = child_clone;
+                }
+            }
+        }
+    }
+
+    return dst;
+}
+
+// Look up a cached layout tree by resource ID. Returns a deep clone on hit, NULL on miss.
+static DxUINode *dx_layout_cache_get(uint32_t resource_id) {
+    if (resource_id == 0) return NULL;
+    for (uint32_t i = 0; i < s_layout_cache_count; i++) {
+        if (s_layout_cache[i].resource_id == resource_id && s_layout_cache[i].tree) {
+            DX_DEBUG(TAG, "Layout cache hit for resource 0x%08x", resource_id);
+            return dx_ui_node_clone(s_layout_cache[i].tree);
+        }
+    }
+    return NULL;
+}
+
+// Insert a layout tree into the cache (stores a deep clone).
+static void dx_layout_cache_put(uint32_t resource_id, const DxUINode *tree) {
+    if (resource_id == 0 || !tree) return;
+
+    // Check for duplicate - update in place
+    for (uint32_t i = 0; i < s_layout_cache_count; i++) {
+        if (s_layout_cache[i].resource_id == resource_id) {
+            dx_ui_node_destroy(s_layout_cache[i].tree);
+            s_layout_cache[i].tree = dx_ui_node_clone(tree);
+            return;
+        }
+    }
+
+    // FIFO eviction if full
+    if (s_layout_cache_count >= DX_LAYOUT_CACHE_SIZE) {
+        // Evict at s_layout_cache_next
+        dx_ui_node_destroy(s_layout_cache[s_layout_cache_next].tree);
+        s_layout_cache[s_layout_cache_next].resource_id = resource_id;
+        s_layout_cache[s_layout_cache_next].tree = dx_ui_node_clone(tree);
+        s_layout_cache_next = (s_layout_cache_next + 1) % DX_LAYOUT_CACHE_SIZE;
+    } else {
+        // Still have room
+        s_layout_cache[s_layout_cache_count].resource_id = resource_id;
+        s_layout_cache[s_layout_cache_count].tree = dx_ui_node_clone(tree);
+        s_layout_cache_count++;
+        s_layout_cache_next = s_layout_cache_count % DX_LAYOUT_CACHE_SIZE;
+    }
+
+    DX_DEBUG(TAG, "Layout cache store for resource 0x%08x (count=%u)", resource_id, s_layout_cache_count);
+}
+
+// Flush the entire layout parse cache.
+void dx_ui_cache_clear(void) {
+    for (uint32_t i = 0; i < s_layout_cache_count; i++) {
+        dx_ui_node_destroy(s_layout_cache[i].tree);
+        s_layout_cache[i].tree = NULL;
+        s_layout_cache[i].resource_id = 0;
+    }
+    s_layout_cache_count = 0;
+    s_layout_cache_next = 0;
+    DX_DEBUG(TAG, "Layout cache cleared");
+}
+
+// ============================================================
 // Dimension unit conversion
 // ============================================================
 
@@ -99,11 +230,31 @@ DxUINode *dx_ui_node_create(DxViewType type, uint32_t view_id) {
     node->constraints.h_chain_style = DX_CHAIN_NONE;
     node->constraints.v_chain_style = DX_CHAIN_NONE;
 
+    // Animation / transform defaults
+    node->alpha = 1.0f;
+    node->rotation = 0.0f;
+    node->scale_x = 1.0f;
+    node->scale_y = 1.0f;
+    node->translation_x = 0.0f;
+    node->translation_y = 0.0f;
+
     // Guideline defaults
     node->is_guideline = false;
     node->guideline_orientation = DX_GUIDELINE_VERTICAL;
     node->guideline_percent = -1.0f;
     node->guideline_begin = -1.0f;
+
+    // Measure/layout defaults
+    node->measured_width = 0.0f;
+    node->measured_height = 0.0f;
+
+    // Focus defaults
+    node->focusable = false;
+    node->focused = false;
+
+    // Diff-based invalidation defaults
+    node->version = 0;
+    node->dirty = true;  // new nodes are dirty by default
 
     return node;
 }
@@ -161,6 +312,7 @@ void dx_ui_node_set_text(DxUINode *node, const char *text) {
     if (!node) return;
     dx_free(node->text);
     node->text = text ? dx_strdup(text) : NULL;
+    dx_ui_node_invalidate(node);
 }
 
 uint32_t dx_ui_node_count(const DxUINode *node) {
@@ -325,6 +477,165 @@ char *dx_ui_tree_dump(DxUINode *root) {
 // Render model (serialized snapshot for Swift bridge)
 // ============================================================
 
+// ============================================================
+// Measure/layout pass
+// ============================================================
+
+// Default intrinsic size for leaf views when wrap_content is used
+#define DX_DEFAULT_TEXT_WIDTH  100.0f
+#define DX_DEFAULT_TEXT_HEIGHT  20.0f
+#define DX_DEFAULT_BUTTON_HEIGHT 48.0f
+#define DX_DEFAULT_EDIT_HEIGHT   48.0f
+#define DX_DEFAULT_IMAGE_SIZE    48.0f
+
+static float dx_ui_intrinsic_width(DxUINode *node) {
+    switch (node->type) {
+        case DX_VIEW_TEXT_VIEW:
+        case DX_VIEW_BUTTON:
+        case DX_VIEW_EDIT_TEXT:
+            return DX_DEFAULT_TEXT_WIDTH;
+        case DX_VIEW_IMAGE_VIEW:
+            return DX_DEFAULT_IMAGE_SIZE;
+        case DX_VIEW_CHECKBOX:
+        case DX_VIEW_SWITCH:
+        case DX_VIEW_RADIO_BUTTON:
+            return DX_DEFAULT_TEXT_WIDTH;
+        default:
+            return 0.0f;
+    }
+}
+
+static float dx_ui_intrinsic_height(DxUINode *node) {
+    switch (node->type) {
+        case DX_VIEW_TEXT_VIEW:
+            return node->text_size > 0 ? node->text_size * 1.4f : DX_DEFAULT_TEXT_HEIGHT;
+        case DX_VIEW_BUTTON:
+            return DX_DEFAULT_BUTTON_HEIGHT;
+        case DX_VIEW_EDIT_TEXT:
+            return DX_DEFAULT_EDIT_HEIGHT;
+        case DX_VIEW_IMAGE_VIEW:
+            return DX_DEFAULT_IMAGE_SIZE;
+        case DX_VIEW_CHECKBOX:
+        case DX_VIEW_SWITCH:
+        case DX_VIEW_RADIO_BUTTON:
+            return DX_DEFAULT_BUTTON_HEIGHT;
+        case DX_VIEW_PROGRESS_BAR:
+        case DX_VIEW_SEEK_BAR:
+            return 24.0f;
+        default:
+            return 0.0f;
+    }
+}
+
+void dx_ui_measure(DxUINode *root, float parent_width, float parent_height) {
+    if (!root) return;
+
+    // Resolve width
+    if (root->width == -1) {
+        // match_parent
+        root->measured_width = parent_width;
+    } else if (root->width == -2) {
+        // wrap_content: will be computed from children or intrinsic size
+        root->measured_width = 0.0f;
+    } else if (root->width > 0) {
+        // Fixed dp value
+        root->measured_width = (float)root->width;
+    }
+
+    // Resolve height
+    if (root->height == -1) {
+        root->measured_height = parent_height;
+    } else if (root->height == -2) {
+        root->measured_height = 0.0f;
+    } else if (root->height > 0) {
+        root->measured_height = (float)root->height;
+    }
+
+    // Available space for children (account for padding)
+    float avail_w = root->measured_width
+                    - (float)root->padding[0] - (float)root->padding[2];
+    float avail_h = root->measured_height
+                    - (float)root->padding[1] - (float)root->padding[3];
+    if (avail_w < 0) avail_w = parent_width;
+    if (avail_h < 0) avail_h = parent_height;
+
+    // Recurse into children
+    bool is_vertical = (root->orientation == DX_ORIENTATION_VERTICAL);
+    float children_sum_w = 0.0f;
+    float children_sum_h = 0.0f;
+    float children_max_w = 0.0f;
+    float children_max_h = 0.0f;
+
+    for (uint32_t i = 0; i < root->child_count; i++) {
+        DxUINode *child = root->children[i];
+        dx_ui_measure(child, avail_w, avail_h);
+
+        float cw = child->measured_width + (float)child->margin[0] + (float)child->margin[2];
+        float ch = child->measured_height + (float)child->margin[1] + (float)child->margin[3];
+
+        children_sum_w += cw;
+        children_sum_h += ch;
+        if (cw > children_max_w) children_max_w = cw;
+        if (ch > children_max_h) children_max_h = ch;
+    }
+
+    // For wrap_content, compute from children or intrinsic size
+    if (root->width == -2) {
+        if (root->child_count > 0) {
+            if (is_vertical) {
+                root->measured_width = children_max_w
+                    + (float)root->padding[0] + (float)root->padding[2];
+            } else {
+                root->measured_width = children_sum_w
+                    + (float)root->padding[0] + (float)root->padding[2];
+            }
+        } else {
+            float intrinsic = dx_ui_intrinsic_width(root);
+            root->measured_width = intrinsic
+                + (float)root->padding[0] + (float)root->padding[2];
+        }
+    }
+
+    if (root->height == -2) {
+        if (root->child_count > 0) {
+            if (is_vertical) {
+                root->measured_height = children_sum_h
+                    + (float)root->padding[1] + (float)root->padding[3];
+            } else {
+                root->measured_height = children_max_h
+                    + (float)root->padding[1] + (float)root->padding[3];
+            }
+        } else {
+            float intrinsic = dx_ui_intrinsic_height(root);
+            root->measured_height = intrinsic
+                + (float)root->padding[1] + (float)root->padding[3];
+        }
+    }
+}
+
+// ============================================================
+// Focus management
+// ============================================================
+
+static void dx_ui_clear_focus_recursive(DxUINode *node) {
+    if (!node) return;
+    node->focused = false;
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        dx_ui_clear_focus_recursive(node->children[i]);
+    }
+}
+
+void dx_ui_set_focus(DxUINode *root, DxUINode *target) {
+    if (!root) return;
+    // Clear all focus in tree
+    dx_ui_clear_focus_recursive(root);
+    // Set focus on target if it's focusable
+    if (target && target->focusable) {
+        target->focused = true;
+        dx_ui_node_invalidate(target);
+    }
+}
+
 static DxRenderNode *serialize_node(DxUINode *node) {
     if (!node) return NULL;
 
@@ -375,8 +686,26 @@ static DxRenderNode *serialize_node(DxUINode *node) {
     rn->vector_width = node->vector_width;
     rn->vector_height = node->vector_height;
     rn->shape_bg = node->shape_bg;
+    rn->alpha = node->alpha;
+    rn->rotation = node->rotation;
+    rn->scale_x = node->scale_x;
+    rn->scale_y = node->scale_y;
+    rn->translation_x = node->translation_x;
+    rn->translation_y = node->translation_y;
     rn->web_url = node->web_url ? dx_strdup(node->web_url) : NULL;
     rn->web_html = node->web_html ? dx_strdup(node->web_html) : NULL;
+
+    // Measure/layout results
+    rn->measured_width = node->measured_width;
+    rn->measured_height = node->measured_height;
+
+    // Focus state
+    rn->focusable = node->focusable;
+    rn->focused = node->focused;
+
+    // Diff-based invalidation
+    rn->version = node->version;
+    rn->dirty = node->dirty;
 
     // Copy draw commands
     if (node->draw_cmd_count > 0 && node->draw_commands) {
@@ -419,9 +748,16 @@ DxRenderModel *dx_render_model_create(DxUINode *root) {
     DxRenderModel *model = (DxRenderModel *)dx_malloc(sizeof(DxRenderModel));
     if (!model) return NULL;
 
+    // Run measure/layout pass before serialization
+    // Use typical mobile screen dimensions as initial available space (390x844 dp)
+    dx_ui_measure(root, 390.0f, 844.0f);
+
     static uint32_t version_counter = 0;
     model->version = ++version_counter;
     model->root = serialize_node(root);
+
+    // Clear dirty flags after serialization snapshot
+    dx_ui_tree_clear_dirty(root);
 
     DX_DEBUG(TAG, "Render model v%u created", model->version);
     return model;
@@ -453,6 +789,33 @@ void dx_render_model_destroy(DxRenderModel *model) {
         dx_free(model->root);
     }
     dx_free(model);
+}
+
+// ============================================================
+// Diff-based invalidation
+// ============================================================
+
+void dx_ui_node_invalidate(DxUINode *node) {
+    if (!node) return;
+    node->dirty = true;
+    node->version++;
+}
+
+bool dx_ui_tree_has_changes(DxUINode *root) {
+    if (!root) return false;
+    if (root->dirty) return true;
+    for (uint32_t i = 0; i < root->child_count; i++) {
+        if (dx_ui_tree_has_changes(root->children[i])) return true;
+    }
+    return false;
+}
+
+void dx_ui_tree_clear_dirty(DxUINode *root) {
+    if (!root) return;
+    root->dirty = false;
+    for (uint32_t i = 0; i < root->child_count; i++) {
+        dx_ui_tree_clear_dirty(root->children[i]);
+    }
 }
 
 // ============================================================
@@ -501,6 +864,12 @@ void dx_render_model_destroy(DxRenderModel *model) {
 #define ATTR_SRC           0x01010119  // android:src (ImageView drawable)
 #define ATTR_INPUT_TYPE    0x01010006  // android:inputType
 #define ATTR_SCALE_TYPE    0x0101011d  // android:scaleType
+#define ATTR_ALPHA         0x0101031f  // android:alpha
+#define ATTR_ROTATION      0x01010326  // android:rotation
+#define ATTR_SCALE_X       0x01010324  // android:scaleX
+#define ATTR_SCALE_Y       0x01010325  // android:scaleY
+#define ATTR_TRANSLATION_X 0x01010322  // android:translationX
+#define ATTR_TRANSLATION_Y 0x01010323  // android:translationY
 
 // Style attribute
 #define ATTR_STYLE         0x010100ba  // android:style (but style is often attr index 0xFFFFFFFF)
@@ -528,6 +897,7 @@ void dx_render_model_destroy(DxRenderModel *model) {
 #define ATTR_LAYOUT_CENTER_IN_PARENT    0x01010134
 #define ATTR_LAYOUT_CENTER_HORIZONTAL   0x01010135
 #define ATTR_LAYOUT_CENTER_VERTICAL     0x01010136
+#define ATTR_FOCUSABLE                  0x010100da  // android:focusable
 
 static uint16_t read_u16(const uint8_t *p) {
     return (uint16_t)(p[0] | (p[1] << 8));
@@ -2241,6 +2611,58 @@ DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_s
                         default: node->scale_type = 0; break; // fitCenter fallback
                     }
                 }
+                // android:alpha (float, 0.0-1.0)
+                else if (attr_res_id == ATTR_ALPHA || strcmp(attr_name, "alpha") == 0) {
+                    if (attr_type == 0x04) { // TYPE_FLOAT
+                        float fval;
+                        memcpy(&fval, &attr_data, sizeof(float));
+                        node->alpha = fval;
+                    }
+                }
+                // android:rotation (float, degrees)
+                else if (attr_res_id == ATTR_ROTATION || strcmp(attr_name, "rotation") == 0) {
+                    if (attr_type == 0x04) {
+                        float fval;
+                        memcpy(&fval, &attr_data, sizeof(float));
+                        node->rotation = fval;
+                    }
+                }
+                // android:scaleX (float)
+                else if (attr_res_id == ATTR_SCALE_X || strcmp(attr_name, "scaleX") == 0) {
+                    if (attr_type == 0x04) {
+                        float fval;
+                        memcpy(&fval, &attr_data, sizeof(float));
+                        node->scale_x = fval;
+                    }
+                }
+                // android:scaleY (float)
+                else if (attr_res_id == ATTR_SCALE_Y || strcmp(attr_name, "scaleY") == 0) {
+                    if (attr_type == 0x04) {
+                        float fval;
+                        memcpy(&fval, &attr_data, sizeof(float));
+                        node->scale_y = fval;
+                    }
+                }
+                // android:translationX (dimension)
+                else if (attr_res_id == ATTR_TRANSLATION_X || strcmp(attr_name, "translationX") == 0) {
+                    if (attr_type == 0x05) {
+                        node->translation_x = dx_ui_decode_dimension(attr_data);
+                    } else if (attr_type == 0x04) {
+                        float fval;
+                        memcpy(&fval, &attr_data, sizeof(float));
+                        node->translation_x = fval;
+                    }
+                }
+                // android:translationY (dimension)
+                else if (attr_res_id == ATTR_TRANSLATION_Y || strcmp(attr_name, "translationY") == 0) {
+                    if (attr_type == 0x05) {
+                        node->translation_y = dx_ui_decode_dimension(attr_data);
+                    } else if (attr_type == 0x04) {
+                        float fval;
+                        memcpy(&fval, &attr_data, sizeof(float));
+                        node->translation_y = fval;
+                    }
+                }
                 // android:layout_width
                 else if (attr_res_id == ATTR_LAYOUT_WIDTH || strcmp(attr_name, "layout_width") == 0) {
                     if (attr_type == 0x05) {
@@ -2366,6 +2788,11 @@ DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_s
                          strcmp(attr_name, "layout_toRightOf") == 0) {
                     node->relative_flags |= DX_REL_RIGHT_OF;
                     node->rel_right_of = attr_data;
+                }
+                // android:focusable (boolean)
+                else if (attr_res_id == ATTR_FOCUSABLE ||
+                         strcmp(attr_name, "focusable") == 0) {
+                    node->focusable = (attr_data != 0);
                 }
                 // ConstraintLayout constraint attributes (app: namespace, matched by name)
                 // Value is either a view ID (resource reference) or "parent" (string 0x03 → look up)
@@ -2518,6 +2945,11 @@ DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_s
                 }
             }
 
+            // EditText views are focusable by default
+            if (vtype == DX_VIEW_EDIT_TEXT && !node->focusable) {
+                node->focusable = true;
+            }
+
             // Add to tree
             if (stack_depth > 0) {
                 dx_ui_node_add_child(stack[stack_depth - 1], node);
@@ -2564,4 +2996,29 @@ DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_s
     }
 
     return DX_ERR_AXML_INVALID;
+}
+
+DxResult dx_layout_parse_cached(DxContext *ctx, uint32_t resource_id,
+                                 const uint8_t *xml_data, uint32_t xml_size, DxUINode **out) {
+    if (!out) return DX_ERR_NULL_PTR;
+
+    // Check cache first
+    if (resource_id != 0) {
+        DxUINode *cached = dx_layout_cache_get(resource_id);
+        if (cached) {
+            *out = cached;
+            return DX_OK;
+        }
+    }
+
+    // Cache miss - parse normally
+    DxResult res = dx_layout_parse(ctx, xml_data, xml_size, out);
+    if (res != DX_OK) return res;
+
+    // Store in cache
+    if (resource_id != 0 && *out) {
+        dx_layout_cache_put(resource_id, *out);
+    }
+
+    return DX_OK;
 }

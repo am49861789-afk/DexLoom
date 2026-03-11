@@ -169,8 +169,28 @@ struct DxUINode {
     // Refresh listener (for SwipeRefreshLayout, implementing OnRefreshListener)
     DxObject    *refresh_listener;
 
+    // Animation / transform properties
+    float         alpha;           // 0.0-1.0 (default 1.0)
+    float         rotation;        // degrees (default 0)
+    float         scale_x;         // scale factor (default 1.0)
+    float         scale_y;         // scale factor (default 1.0)
+    float         translation_x;   // dp offset (default 0)
+    float         translation_y;   // dp offset (default 0)
+
     // Back-reference to runtime object
     DxObject    *runtime_obj;
+
+    // Measure/layout pass results
+    float         measured_width;  // resolved width in dp (0 = not measured)
+    float         measured_height; // resolved height in dp (0 = not measured)
+
+    // Focus management
+    bool          focusable;       // true if view can receive focus
+    bool          focused;         // true if view currently has focus
+
+    // Diff-based invalidation
+    uint32_t     version;          // incremented on property changes
+    bool         dirty;            // true if node needs re-render
 
     // Canvas draw commands (populated by View.onDraw dispatch)
     DxDrawCommand *draw_commands;
@@ -247,6 +267,26 @@ typedef struct DxRenderNode {
     char        *web_url;          // URL to load (owned copy)
     char        *web_html;         // HTML content to load (owned copy)
 
+    // Animation / transform properties
+    float          alpha;            // 0.0-1.0 (default 1.0)
+    float          rotation;         // degrees (default 0)
+    float          scale_x;          // scale factor (default 1.0)
+    float          scale_y;          // scale factor (default 1.0)
+    float          translation_x;    // dp offset (default 0)
+    float          translation_y;    // dp offset (default 0)
+
+    // Measure/layout pass results
+    float          measured_width;  // resolved width in dp (0 = not measured)
+    float          measured_height; // resolved height in dp (0 = not measured)
+
+    // Focus management
+    bool           focusable;       // true if view can receive focus
+    bool           focused;         // true if view currently has focus
+
+    // Diff-based invalidation
+    uint32_t       version;        // snapshot of DxUINode version at serialization time
+    bool           dirty;          // true if this node changed since last serialization
+
     // Canvas draw commands (owned copies)
     DxDrawCommand *draw_commands;
     uint32_t       draw_cmd_count;
@@ -277,11 +317,29 @@ void           dx_render_model_destroy(DxRenderModel *model);
 // Layout XML parsing -> UI tree
 DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_size, DxUINode **out);
 
+// Layout XML parsing with cache (resource_id used as cache key; 0 = no caching)
+DxResult dx_layout_parse_cached(DxContext *ctx, uint32_t resource_id,
+                                 const uint8_t *xml_data, uint32_t xml_size, DxUINode **out);
+
+// Flush the layout parse cache
+void dx_ui_cache_clear(void);
+
 // Dimension unit conversion (dp/sp/px -> iOS points)
 float dx_ui_dp_to_points(float dp);
 float dx_ui_sp_to_points(float sp);
 
 // UI tree inspector - returns a malloc'd string showing the tree hierarchy
 char *dx_ui_tree_dump(DxUINode *root);
+
+// Diff-based invalidation
+void dx_ui_node_invalidate(DxUINode *node);
+bool dx_ui_tree_has_changes(DxUINode *root);
+void dx_ui_tree_clear_dirty(DxUINode *root);
+
+// Measure/layout pass
+void dx_ui_measure(DxUINode *root, float parent_width, float parent_height);
+
+// Focus management
+void dx_ui_set_focus(DxUINode *root, DxUINode *target);
 
 #endif // DX_VIEW_H

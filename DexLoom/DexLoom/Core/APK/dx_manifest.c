@@ -46,6 +46,7 @@ static void append_string(char ***array, uint32_t *count, const char *str) {
 #define ATTR_PATH_PATTERN 0x0101002c
 #define ATTR_MIME_TYPE  0x01010026
 #define ATTR_RESOURCE   0x01010025
+#define ATTR_TARGET_PKG 0x01010021
 
 // Attribute value types
 #define ATTR_TYPE_STRING    0x03
@@ -90,13 +91,45 @@ static char *decode_axml_string(const uint8_t *pool_data, uint32_t pool_size,
             char_count = ((char_count & 0x7FFF) << 16) | read_u16(p);
             p += 2;
         }
-        char *s = (char *)dx_malloc(char_count + 1);
+        // Worst case: each UTF-16 code unit -> 3 bytes UTF-8, surrogate pair -> 4 bytes
+        char *s = (char *)dx_malloc(char_count * 3 + 1);
         if (!s) return NULL;
+        uint32_t out_pos = 0;
         for (uint32_t i = 0; i < char_count; i++) {
             uint16_t c = read_u16(p + i * 2);
-            s[i] = (c < 128) ? (char)c : '?';
+            if (c < 0x80) {
+                s[out_pos++] = (char)c;
+            } else if (c < 0x800) {
+                s[out_pos++] = (char)(0xC0 | (c >> 6));
+                s[out_pos++] = (char)(0x80 | (c & 0x3F));
+            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < char_count) {
+                // High surrogate - check for low surrogate
+                uint16_t lo = read_u16(p + (i + 1) * 2);
+                if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                    uint32_t cp = 0x10000 + ((uint32_t)(c - 0xD800) << 10) + (lo - 0xDC00);
+                    s[out_pos++] = (char)(0xF0 | (cp >> 18));
+                    s[out_pos++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                    s[out_pos++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                    s[out_pos++] = (char)(0x80 | (cp & 0x3F));
+                    i++; // skip low surrogate
+                } else {
+                    // Lone high surrogate - emit replacement char U+FFFD
+                    s[out_pos++] = (char)0xEF;
+                    s[out_pos++] = (char)0xBF;
+                    s[out_pos++] = (char)0xBD;
+                }
+            } else if (c >= 0xDC00 && c <= 0xDFFF) {
+                // Lone low surrogate - emit replacement char U+FFFD
+                s[out_pos++] = (char)0xEF;
+                s[out_pos++] = (char)0xBF;
+                s[out_pos++] = (char)0xBD;
+            } else {
+                s[out_pos++] = (char)(0xE0 | (c >> 12));
+                s[out_pos++] = (char)(0x80 | ((c >> 6) & 0x3F));
+                s[out_pos++] = (char)(0x80 | (c & 0x3F));
+            }
         }
-        s[char_count] = '\0';
+        s[out_pos] = '\0';
         return s;
     }
 }
@@ -113,16 +146,22 @@ DxResult dx_axml_parse(const uint8_t *data, uint32_t size, DxAxmlParser **out) {
 
     DxAxmlParser *parser = (DxAxmlParser *)dx_malloc(sizeof(DxAxmlParser));
     if (!parser) return DX_ERR_OUT_OF_MEMORY;
+    memset(parser, 0, sizeof(DxAxmlParser));
 
     // Parse string pool (always first chunk after header)
     uint32_t pos = 8;
-    if (pos + 8 > size) goto fail;
+    if (pos + 28 > size) goto fail;  // need at least 28 bytes for string pool header
 
     uint16_t chunk_type = read_u16(data + pos);
     uint32_t chunk_size = read_u32(data + pos + 4);
 
     if (chunk_type != AXML_CHUNK_STRINGPOOL) {
         DX_ERROR(TAG, "Expected string pool chunk, got 0x%04x", chunk_type);
+        goto fail;
+    }
+
+    if (chunk_size < 28 || pos + chunk_size > size) {
+        DX_ERROR(TAG, "String pool chunk size invalid: %u", chunk_size);
         goto fail;
     }
 
@@ -138,18 +177,19 @@ DxResult dx_axml_parse(const uint8_t *data, uint32_t size, DxAxmlParser **out) {
         goto fail;
     }
 
-    // Integer overflow protection on string pool allocation
-    if (string_count > SIZE_MAX / sizeof(char *)) {
-        DX_ERROR(TAG, "AXML string pool count %u would overflow allocation", string_count);
-        goto fail;
-    }
-
     parser->string_count = string_count;
     parser->strings = (char **)dx_malloc(sizeof(char *) * string_count);
     if (!parser->strings) goto fail;
 
     uint32_t offsets_start = pos + 28;
     uint32_t pool_data_start = pos + strings_start;
+
+    // Validate pool_data_start doesn't exceed file bounds
+    if (strings_start < 28 || pool_data_start > size) {
+        DX_ERROR(TAG, "AXML strings_start out of bounds: %u (chunk at %u, size %u)",
+                 strings_start, pos, size);
+        goto fail;
+    }
 
     for (uint32_t i = 0; i < string_count; i++) {
         if (offsets_start + i * 4 + 4 > size) break;
@@ -167,13 +207,16 @@ DxResult dx_axml_parse(const uint8_t *data, uint32_t size, DxAxmlParser **out) {
     if (pos + 8 <= size) {
         chunk_type = read_u16(data + pos);
         chunk_size = read_u32(data + pos + 4);
-        if (chunk_type == AXML_CHUNK_RESOURCEMAP) {
+        if (chunk_type == AXML_CHUNK_RESOURCEMAP && chunk_size >= 8 &&
+            pos + chunk_size <= size) {
             uint32_t id_count = (chunk_size - 8) / 4;
             parser->res_id_count = id_count;
             parser->res_ids = (uint32_t *)dx_malloc(sizeof(uint32_t) * id_count);
             if (parser->res_ids) {
                 for (uint32_t i = 0; i < id_count; i++) {
-                    parser->res_ids[i] = read_u32(data + pos + 8 + i * 4);
+                    uint32_t id_off = pos + 8 + i * 4;
+                    if (id_off + 4 > size) break;
+                    parser->res_ids[i] = read_u32(data + id_off);
                 }
             }
         }
@@ -195,8 +238,63 @@ void dx_axml_free(DxAxmlParser *parser) {
     }
     dx_free(parser->strings);
     dx_free(parser->res_ids);
+    // Free namespace bindings
+    for (uint32_t i = 0; i < parser->ns_count; i++) {
+        dx_free(parser->ns_prefixes[i]);
+        dx_free(parser->ns_uris[i]);
+    }
+    dx_free(parser->ns_prefixes);
+    dx_free(parser->ns_uris);
     dx_free(parser);
 }
+
+// ---- Namespace tracking helpers ----
+static void axml_push_namespace(DxAxmlParser *axml, const char *prefix, const char *uri) {
+    if (axml->ns_count >= axml->ns_capacity) {
+        uint32_t new_cap = axml->ns_capacity == 0 ? 8 : axml->ns_capacity * 2;
+        char **new_prefixes = (char **)dx_realloc(axml->ns_prefixes, sizeof(char *) * new_cap);
+        char **new_uris = (char **)dx_realloc(axml->ns_uris, sizeof(char *) * new_cap);
+        if (!new_prefixes || !new_uris) {
+            dx_free(new_prefixes);
+            dx_free(new_uris);
+            return;
+        }
+        axml->ns_prefixes = new_prefixes;
+        axml->ns_uris = new_uris;
+        axml->ns_capacity = new_cap;
+    }
+    axml->ns_prefixes[axml->ns_count] = dx_strdup(prefix ? prefix : "");
+    axml->ns_uris[axml->ns_count] = dx_strdup(uri ? uri : "");
+    axml->ns_count++;
+}
+
+static void axml_pop_namespace(DxAxmlParser *axml, const char *prefix) {
+    // Remove the most recent binding for this prefix (stack-like)
+    for (int i = (int)axml->ns_count - 1; i >= 0; i--) {
+        if (strcmp(axml->ns_prefixes[i], prefix ? prefix : "") == 0) {
+            dx_free(axml->ns_prefixes[i]);
+            dx_free(axml->ns_uris[i]);
+            // Shift remaining entries down
+            for (uint32_t j = (uint32_t)i; j + 1 < axml->ns_count; j++) {
+                axml->ns_prefixes[j] = axml->ns_prefixes[j + 1];
+                axml->ns_uris[j] = axml->ns_uris[j + 1];
+            }
+            axml->ns_count--;
+            return;
+        }
+    }
+}
+
+// Resolve a namespace string-pool index to a URI string
+static const char *axml_resolve_ns_uri(const DxAxmlParser *axml, uint32_t ns_idx) {
+    if (ns_idx == 0xFFFFFFFF || ns_idx >= axml->string_count)
+        return NULL;
+    return axml->strings[ns_idx];
+}
+
+// Well-known namespace URIs
+#define NS_ANDROID "http://schemas.android.com/apk/res/android"
+#define NS_AUTO    "http://schemas.android.com/apk/res-auto"
 
 // ---- Helper: resolve resource ID from attribute name index ----
 static uint32_t resolve_res_id(const DxAxmlParser *axml, uint32_t name_idx) {
@@ -205,15 +303,36 @@ static uint32_t resolve_res_id(const DxAxmlParser *axml, uint32_t name_idx) {
     return 0;
 }
 
-// ---- Helper: check if attribute name matches either by res-id or string name ----
-static bool attr_is(const DxAxmlParser *axml, uint32_t name_idx,
-                     uint32_t expected_res_id, const char *fallback_name) {
+// ---- Helper: namespace-aware attribute matching ----
+// Prefer matching by (namespace_uri, name) pair, then fall back to resource ID, then string name.
+static bool attr_is_ns(const DxAxmlParser *axml, uint32_t ns_idx, uint32_t name_idx,
+                        const char *expected_ns, uint32_t expected_res_id, const char *fallback_name) {
+    // 1. Try namespace + name match
+    if (expected_ns && ns_idx != 0xFFFFFFFF && ns_idx < axml->string_count) {
+        const char *ns_uri = axml->strings[ns_idx];
+        if (strcmp(ns_uri, expected_ns) == 0 &&
+            fallback_name && name_idx < axml->string_count &&
+            strcmp(axml->strings[name_idx], fallback_name) == 0) {
+            return true;
+        }
+    }
+
+    // 2. Fall back to resource ID matching
     uint32_t rid = resolve_res_id(axml, name_idx);
-    if (rid == expected_res_id) return true;
+    if (rid != 0 && rid == expected_res_id) return true;
+
+    // 3. Fall back to name-only matching (for attributes without namespace)
     if (fallback_name && name_idx < axml->string_count &&
         strcmp(axml->strings[name_idx], fallback_name) == 0)
         return true;
+
     return false;
+}
+
+// ---- Legacy helper: check if attribute name matches either by res-id or string name ----
+static bool attr_is(const DxAxmlParser *axml, uint32_t name_idx,
+                     uint32_t expected_res_id, const char *fallback_name) {
+    return attr_is_ns(axml, 0xFFFFFFFF, name_idx, NULL, expected_res_id, fallback_name);
 }
 
 // ---- Helper: get string value from attribute data ----
@@ -335,24 +454,63 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
         uint16_t chunk_type = read_u16(data + pos);
         uint32_t chunk_size = read_u32(data + pos + 4);
 
-        if (chunk_size < 8 || pos + chunk_size > size) break;
+        if (chunk_size < 8 || pos + chunk_size > size) {
+            DX_WARN(TAG, "Malformed AXML chunk at offset %u: size=%u (file size=%u), skipping to next aligned boundary",
+                    pos, chunk_size, size);
+            // Skip to next 4-byte aligned boundary
+            pos += 4;
+            pos = (pos + 3) & ~(uint32_t)3;
+            continue;
+        }
 
-        if (chunk_type == AXML_CHUNK_START_TAG) {
+        if (chunk_type == AXML_CHUNK_START_NS) {
+            // START_NAMESPACE: prefix(4) + uri(4) at offset +16 and +20
+            if (pos + 24 <= size) {
+                uint32_t prefix_idx = read_u32(data + pos + 16);
+                uint32_t uri_idx = read_u32(data + pos + 20);
+                const char *prefix = (prefix_idx < axml->string_count) ? axml->strings[prefix_idx] : "";
+                const char *uri = (uri_idx < axml->string_count) ? axml->strings[uri_idx] : "";
+                axml_push_namespace(axml, prefix, uri);
+                DX_DEBUG(TAG, "NS start: %s -> %s", prefix, uri);
+            }
+            pos += chunk_size;
+            continue;
+        } else if (chunk_type == AXML_CHUNK_END_NS) {
+            // END_NAMESPACE: prefix(4) at offset +16
+            if (pos + 20 <= size) {
+                uint32_t prefix_idx = read_u32(data + pos + 16);
+                const char *prefix = (prefix_idx < axml->string_count) ? axml->strings[prefix_idx] : "";
+                axml_pop_namespace(axml, prefix);
+                DX_DEBUG(TAG, "NS end: %s", prefix);
+            }
+            pos += chunk_size;
+            continue;
+        } else if (chunk_type == AXML_CHUNK_START_TAG) {
             xml_depth++;
             if (xml_depth > AXML_MAX_DEPTH) {
-                DX_ERROR(TAG, "AXML nesting depth exceeds limit (%u)", AXML_MAX_DEPTH);
-                dx_free(current_activity_name);
-                dx_axml_free(axml);
-                dx_manifest_free(manifest);
-                return DX_ERR_AXML_INVALID;
+                DX_ERROR(TAG, "AXML nesting depth exceeds limit (%u), skipping branch", AXML_MAX_DEPTH);
+                pos += chunk_size;
+                continue;
             }
             if (pos + 28 > size) break;
 
             uint32_t name_idx = read_u32(data + pos + 20);
             uint16_t attr_count = read_u16(data + pos + 28);
 
-            const char *tag_name = (name_idx < axml->string_count) ?
-                                    axml->strings[name_idx] : "";
+            // Cap attribute count per element to prevent excessive iteration
+            if (attr_count > 256) {
+                DX_WARN(TAG, "AXML element has %u attributes, capping at 256", attr_count);
+                attr_count = 256;
+            }
+
+            const char *tag_name;
+            if (name_idx < axml->string_count) {
+                tag_name = axml->strings[name_idx];
+            } else {
+                DX_WARN(TAG, "AXML start tag string ref %u out of bounds (pool size %u), substituting <invalid>",
+                        name_idx, axml->string_count);
+                tag_name = "<invalid>";
+            }
 
             // --- Parse attributes into temp storage ---
             // For each attribute: ns(4) name(4) rawValue(4) typedValue(type:4 data:4) = 20 bytes
@@ -362,10 +520,12 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
+                    uint32_t nsi = read_u32(data + aoff);
                     uint32_t ani = read_u32(data + aoff + 4);
                     uint32_t atype = read_u32(data + aoff + 12) >> 24;
                     uint32_t adata = read_u32(data + aoff + 16);
 
+                    // "package" attribute has no namespace
                     if (ani < axml->string_count &&
                         strcmp(axml->strings[ani], "package") == 0 &&
                         atype == ATTR_TYPE_STRING &&
@@ -373,18 +533,19 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                         manifest->package_name = dx_strdup(axml->strings[adata]);
                         DX_INFO(TAG, "Package: %s", manifest->package_name);
                     }
+                    (void)nsi; // namespace available for future use
                 }
             } else if (strcmp(tag_name, "uses-sdk") == 0) {
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
+                    uint32_t nsi = read_u32(data + aoff);
                     uint32_t ani = read_u32(data + aoff + 4);
-                    uint32_t rid = resolve_res_id(axml, ani);
                     uint32_t adata = read_u32(data + aoff + 16);
-                    if (rid == ATTR_MIN_SDK) {
+                    if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_MIN_SDK, "minSdkVersion")) {
                         manifest->min_sdk = (int32_t)adata;
                         DX_INFO(TAG, "minSdkVersion: %d", manifest->min_sdk);
-                    } else if (rid == ATTR_TARGET_SDK) {
+                    } else if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_TARGET_SDK, "targetSdkVersion")) {
                         manifest->target_sdk = (int32_t)adata;
                         DX_INFO(TAG, "targetSdkVersion: %d", manifest->target_sdk);
                     }
@@ -393,10 +554,11 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
+                    uint32_t nsi = read_u32(data + aoff);
                     uint32_t ani = read_u32(data + aoff + 4);
                     uint32_t atype = read_u32(data + aoff + 12) >> 24;
                     uint32_t adata = read_u32(data + aoff + 16);
-                    if (attr_is(axml, ani, ATTR_NAME, "name") &&
+                    if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_NAME, "name") &&
                         atype == ATTR_TYPE_STRING && adata < axml->string_count) {
                         append_string(&manifest->permissions, &manifest->permission_count,
                                       axml->strings[adata]);
@@ -409,13 +571,14 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
+                    uint32_t nsi = read_u32(data + aoff);
                     uint32_t ani = read_u32(data + aoff + 4);
                     uint32_t atype = read_u32(data + aoff + 12) >> 24;
                     uint32_t adata = read_u32(data + aoff + 16);
-                    if (attr_is(axml, ani, ATTR_NAME, "name")) {
+                    if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_NAME, "name")) {
                         dx_free(feat_name);
                         feat_name = attr_string(axml, atype, adata);
-                    } else if (attr_is(axml, ani, ATTR_REQUIRED, "required")) {
+                    } else if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_REQUIRED, "required")) {
                         if (atype == ATTR_TYPE_INT_BOOL || atype == ATTR_TYPE_INT_DEC)
                             feat_required = (adata != 0);
                     }
@@ -440,13 +603,14 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
+                    uint32_t nsi = read_u32(data + aoff);
                     uint32_t ani = read_u32(data + aoff + 4);
                     uint32_t atype = read_u32(data + aoff + 12) >> 24;
                     uint32_t adata = read_u32(data + aoff + 16);
-                    if (attr_is(axml, ani, ATTR_NAME, "name")) {
+                    if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_NAME, "name")) {
                         dx_free(lib_name);
                         lib_name = attr_string(axml, atype, adata);
-                    } else if (attr_is(axml, ani, ATTR_REQUIRED, "required")) {
+                    } else if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_REQUIRED, "required")) {
                         if (atype == ATTR_TYPE_INT_BOOL || atype == ATTR_TYPE_INT_DEC)
                             lib_required = (adata != 0);
                     }
@@ -472,16 +636,18 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
+                    uint32_t nsi = read_u32(data + aoff);
                     uint32_t ani = read_u32(data + aoff + 4);
-                    uint32_t rid = resolve_res_id(axml, ani);
                     uint32_t atype = read_u32(data + aoff + 12) >> 24;
                     uint32_t adata = read_u32(data + aoff + 16);
-                    if (rid == ATTR_LABEL && atype == ATTR_TYPE_STRING &&
+                    if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_LABEL, "label") &&
+                        atype == ATTR_TYPE_STRING &&
                         adata < axml->string_count && !manifest->app_label) {
                         manifest->app_label = dx_strdup(axml->strings[adata]);
                         DX_INFO(TAG, "App label: %s", manifest->app_label);
                     }
-                    if (rid == ATTR_THEME && !manifest->app_theme) {
+                    if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_THEME, "theme") &&
+                        !manifest->app_theme) {
                         if (atype == ATTR_TYPE_STRING && adata < axml->string_count) {
                             manifest->app_theme = dx_strdup(axml->strings[adata]);
                         } else {
@@ -502,13 +668,14 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
+                    uint32_t nsi = read_u32(data + aoff);
                     uint32_t ani = read_u32(data + aoff + 4);
                     uint32_t atype = read_u32(data + aoff + 12) >> 24;
                     uint32_t adata = read_u32(data + aoff + 16);
-                    if (attr_is(axml, ani, ATTR_NAME, "name")) {
+                    if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_NAME, "name")) {
                         dx_free(comp_name);
                         comp_name = attr_string(axml, atype, adata);
-                    } else if (attr_is(axml, ani, ATTR_EXPORTED, "exported")) {
+                    } else if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_EXPORTED, "exported")) {
                         exported_set = true;
                         if (atype == ATTR_TYPE_INT_BOOL || atype == ATTR_TYPE_INT_DEC)
                             exported = (adata != 0);
@@ -543,13 +710,14 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
+                    uint32_t nsi = read_u32(data + aoff);
                     uint32_t ani = read_u32(data + aoff + 4);
                     uint32_t atype = read_u32(data + aoff + 12) >> 24;
                     uint32_t adata = read_u32(data + aoff + 16);
-                    if (attr_is(axml, ani, ATTR_NAME, "name")) {
+                    if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_NAME, "name")) {
                         dx_free(comp_name);
                         comp_name = attr_string(axml, atype, adata);
-                    } else if (attr_is(axml, ani, ATTR_EXPORTED, "exported")) {
+                    } else if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_EXPORTED, "exported")) {
                         exported_set = true;
                         if (atype == ATTR_TYPE_INT_BOOL || atype == ATTR_TYPE_INT_DEC)
                             exported = (adata != 0);
@@ -579,13 +747,14 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
+                    uint32_t nsi = read_u32(data + aoff);
                     uint32_t ani = read_u32(data + aoff + 4);
                     uint32_t atype = read_u32(data + aoff + 12) >> 24;
                     uint32_t adata = read_u32(data + aoff + 16);
-                    if (attr_is(axml, ani, ATTR_NAME, "name")) {
+                    if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_NAME, "name")) {
                         dx_free(comp_name);
                         comp_name = attr_string(axml, atype, adata);
-                    } else if (attr_is(axml, ani, ATTR_EXPORTED, "exported")) {
+                    } else if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_EXPORTED, "exported")) {
                         exported_set = true;
                         if (atype == ATTR_TYPE_INT_BOOL || atype == ATTR_TYPE_INT_DEC)
                             exported = (adata != 0);
@@ -615,13 +784,14 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
+                    uint32_t nsi = read_u32(data + aoff);
                     uint32_t ani = read_u32(data + aoff + 4);
                     uint32_t atype = read_u32(data + aoff + 12) >> 24;
                     uint32_t adata = read_u32(data + aoff + 16);
-                    if (attr_is(axml, ani, ATTR_NAME, "name")) {
+                    if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_NAME, "name")) {
                         dx_free(comp_name);
                         comp_name = attr_string(axml, atype, adata);
-                    } else if (attr_is(axml, ani, ATTR_EXPORTED, "exported")) {
+                    } else if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_EXPORTED, "exported")) {
                         exported_set = true;
                         if (atype == ATTR_TYPE_INT_BOOL || atype == ATTR_TYPE_INT_DEC)
                             exported = (adata != 0);
@@ -643,6 +813,47 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                 current_comp_type = COMP_PROVIDER;
                 dx_free(resolved);
                 dx_free(comp_name);
+            } else if (strcmp(tag_name, "instrumentation") == 0) {
+                char *inst_name = NULL;
+                char *inst_target = NULL;
+                for (uint16_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t nsi = read_u32(data + aoff);
+                    uint32_t ani = read_u32(data + aoff + 4);
+                    uint32_t atype = read_u32(data + aoff + 12) >> 24;
+                    uint32_t adata = read_u32(data + aoff + 16);
+                    if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_NAME, "name")) {
+                        dx_free(inst_name);
+                        inst_name = attr_string(axml, atype, adata);
+                    } else if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_TARGET_PKG, "targetPackage")) {
+                        dx_free(inst_target);
+                        inst_target = attr_string(axml, atype, adata);
+                    }
+                }
+                if (inst_name) {
+                    char *resolved = resolve_class_name(inst_name, manifest->package_name);
+                    uint32_t n = manifest->instrumentation_count;
+                    DxInstrumentation *new_arr = (DxInstrumentation *)dx_realloc(
+                        manifest->instrumentations, sizeof(DxInstrumentation) * (n + 1));
+                    if (new_arr) {
+                        new_arr[n].name = resolved ? resolved : dx_strdup(inst_name);
+                        new_arr[n].target_package = inst_target ? inst_target : NULL;
+                        manifest->instrumentations = new_arr;
+                        manifest->instrumentation_count = n + 1;
+                        DX_INFO(TAG, "Instrumentation: %s -> %s",
+                                new_arr[n].name, inst_target ? inst_target : "(none)");
+                        inst_target = NULL; // ownership transferred
+                        if (resolved != inst_name) {
+                            // resolved was a new allocation, inst_name can be freed
+                        }
+                    } else {
+                        dx_free(resolved);
+                        dx_free(inst_target);
+                    }
+                }
+                dx_free(inst_name);
+                dx_free(inst_target);
             } else if (strcmp(tag_name, "intent-filter") == 0) {
                 in_intent_filter = true;
                 memset(&current_filter, 0, sizeof(current_filter));
@@ -650,11 +861,12 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
+                    uint32_t nsi = read_u32(data + aoff);
                     uint32_t ani = read_u32(data + aoff + 4);
                     uint32_t atype = read_u32(data + aoff + 12) >> 24;
                     uint32_t adata = read_u32(data + aoff + 16);
 
-                    if (attr_is(axml, ani, ATTR_NAME, "name") &&
+                    if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_NAME, "name") &&
                         atype == ATTR_TYPE_STRING && adata < axml->string_count) {
                         const char *action = axml->strings[adata];
                         append_string(&current_filter.actions, &current_filter.action_count, action);
@@ -666,11 +878,12 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
+                    uint32_t nsi = read_u32(data + aoff);
                     uint32_t ani = read_u32(data + aoff + 4);
                     uint32_t atype = read_u32(data + aoff + 12) >> 24;
                     uint32_t adata = read_u32(data + aoff + 16);
 
-                    if (attr_is(axml, ani, ATTR_NAME, "name") &&
+                    if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_NAME, "name") &&
                         atype == ATTR_TYPE_STRING && adata < axml->string_count) {
                         const char *cat = axml->strings[adata];
                         append_string(&current_filter.categories, &current_filter.category_count, cat);
@@ -685,21 +898,22 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
+                    uint32_t nsi = read_u32(data + aoff);
                     uint32_t ani = read_u32(data + aoff + 4);
                     uint32_t atype = read_u32(data + aoff + 12) >> 24;
                     uint32_t adata = read_u32(data + aoff + 16);
 
-                    if (attr_is(axml, ani, ATTR_SCHEME, "scheme")) {
+                    if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_SCHEME, "scheme")) {
                         d.scheme = attr_string(axml, atype, adata);
-                    } else if (attr_is(axml, ani, ATTR_HOST, "host")) {
+                    } else if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_HOST, "host")) {
                         d.host = attr_string(axml, atype, adata);
-                    } else if (attr_is(axml, ani, ATTR_PATH, "path")) {
+                    } else if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_PATH, "path")) {
                         d.path = attr_string(axml, atype, adata);
-                    } else if (attr_is(axml, ani, ATTR_PATH_PREFIX, "pathPrefix")) {
+                    } else if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_PATH_PREFIX, "pathPrefix")) {
                         d.path_prefix = attr_string(axml, atype, adata);
-                    } else if (attr_is(axml, ani, ATTR_PATH_PATTERN, "pathPattern")) {
+                    } else if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_PATH_PATTERN, "pathPattern")) {
                         d.path_pattern = attr_string(axml, atype, adata);
-                    } else if (attr_is(axml, ani, ATTR_MIME_TYPE, "mimeType")) {
+                    } else if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_MIME_TYPE, "mimeType")) {
                         d.mime_type = attr_string(axml, atype, adata);
                     }
                 }
@@ -718,14 +932,15 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
+                    uint32_t nsi = read_u32(data + aoff);
                     uint32_t ani = read_u32(data + aoff + 4);
                     uint32_t atype = read_u32(data + aoff + 12) >> 24;
                     uint32_t adata = read_u32(data + aoff + 16);
 
-                    if (attr_is(axml, ani, ATTR_NAME, "name")) {
+                    if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_NAME, "name")) {
                         dx_free(md_name);
                         md_name = attr_string(axml, atype, adata);
-                    } else if (attr_is(axml, ani, ATTR_VALUE, "value")) {
+                    } else if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_VALUE, "value")) {
                         dx_free(md_value);
                         if (atype == ATTR_TYPE_STRING && adata < axml->string_count) {
                             md_value = dx_strdup(axml->strings[adata]);
@@ -740,7 +955,7 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                         } else if (atype == ATTR_TYPE_INT_BOOL) {
                             md_value = dx_strdup(adata ? "true" : "false");
                         }
-                    } else if (attr_is(axml, ani, ATTR_RESOURCE, "resource")) {
+                    } else if (attr_is_ns(axml, nsi, ani, NS_ANDROID, ATTR_RESOURCE, "resource")) {
                         // android:resource is an alternative to android:value
                         if (!md_value) {
                             char buf[32];
@@ -767,8 +982,14 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
         } else if (chunk_type == AXML_CHUNK_END_TAG) {
             if (xml_depth > 0) xml_depth--;
             uint32_t name_idx = read_u32(data + pos + 20);
-            const char *tag_name = (name_idx < axml->string_count) ?
-                                    axml->strings[name_idx] : "";
+            const char *tag_name;
+            if (name_idx < axml->string_count) {
+                tag_name = axml->strings[name_idx];
+            } else {
+                DX_WARN(TAG, "AXML end tag string ref %u out of bounds (pool size %u), substituting <invalid>",
+                        name_idx, axml->string_count);
+                tag_name = "<invalid>";
+            }
 
             if (strcmp(tag_name, "intent-filter") == 0) {
                 // Check for main/launcher
@@ -817,6 +1038,8 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
             } else if (strcmp(tag_name, "provider") == 0) {
                 current_comp_type = in_application ? COMP_APPLICATION : COMP_NONE;
                 current_comp = NULL;
+            } else if (strcmp(tag_name, "instrumentation") == 0) {
+                // instrumentation is a leaf-level element, no state to reset
             } else if (strcmp(tag_name, "application") == 0) {
                 in_application = false;
                 current_comp_type = COMP_NONE;
@@ -837,8 +1060,9 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
     DX_INFO(TAG, "Manifest: %u permissions, %u activities, %u services, %u receivers, %u providers",
             manifest->permission_count, manifest->activity_count,
             manifest->service_count, manifest->receiver_count, manifest->provider_count);
-    DX_INFO(TAG, "Manifest: %u features, %u libraries, %u app meta-data",
-            manifest->feature_count, manifest->library_count, manifest->app_meta_data_count);
+    DX_INFO(TAG, "Manifest: %u features, %u libraries, %u app meta-data, %u instrumentations",
+            manifest->feature_count, manifest->library_count, manifest->app_meta_data_count,
+            manifest->instrumentation_count);
 
     *out = manifest;
     return DX_OK;
@@ -920,6 +1144,12 @@ void dx_manifest_free(DxManifest *manifest) {
     for (uint32_t i = 0; i < manifest->library_count; i++)
         dx_free(manifest->libraries[i].name);
     dx_free(manifest->libraries);
+
+    for (uint32_t i = 0; i < manifest->instrumentation_count; i++) {
+        dx_free(manifest->instrumentations[i].name);
+        dx_free(manifest->instrumentations[i].target_package);
+    }
+    dx_free(manifest->instrumentations);
 
     dx_free(manifest);
 }
