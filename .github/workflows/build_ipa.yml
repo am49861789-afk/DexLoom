@@ -5,12 +5,12 @@ on:
     branches: [ "main", "master" ]
   pull_request:
     branches: [ "main", "master" ]
-  workflow_dispatch: # 允许在 GitHub Actions 网页端手动触发构建
+  workflow_dispatch:
 
 jobs:
   build-unsigned-ipa:
     name: Build Unsigned IPA
-    runs-on: macos-latest # 必须使用 macOS 运行环境来提供 Xcode
+    runs-on: macos-14 # 推荐使用明确的 macOS 版本
 
     steps:
       - name: 📥 检出代码 (Checkout Repository)
@@ -18,8 +18,22 @@ jobs:
 
       - name: 🏗️ 编译项目 (Build iOS App)
         run: |
+          echo "查找 Xcode 项目文件..."
+          # 自动搜索 DexLoom.xcodeproj 所在的相对路径
+          PROJECT_PATH=$(find . -name "DexLoom.xcodeproj" | head -n 1)
+          
+          if [ -z "$PROJECT_PATH" ]; then
+            echo "错误: 找不到 DexLoom.xcodeproj 文件！请检查仓库代码是否完整。"
+            exit 1
+          fi
+          
+          PROJECT_DIR=$(dirname "$PROJECT_PATH")
+          echo "找到项目所在目录: $PROJECT_DIR"
+          
+          # 进入项目所在目录
+          cd "$PROJECT_DIR"
+          
           echo "开始执行免签名编译..."
-          # 强制禁用代码签名，直接编译出 Release 版本的 DexLoom.app
           xcodebuild clean build \
             -project DexLoom.xcodeproj \
             -scheme DexLoom \
@@ -33,13 +47,18 @@ jobs:
       - name: 📦 打包为 IPA (Package to IPA)
         run: |
           echo "组装 IPA 文件结构..."
-          # IPA 文件的标准结构是外层有一个 Payload 目录
+          # 再次定位目录，找到编译出的产物
+          PROJECT_DIR=$(dirname $(find . -name "DexLoom.xcodeproj" | head -n 1))
+          APP_PATH="$PROJECT_DIR/build/Build/Products/Release-iphoneos/DexLoom.app"
+          
+          if [ ! -d "$APP_PATH" ]; then
+            echo "错误: 找不到编译后的 .app 文件！"
+            exit 1
+          fi
+          
+          # 在当前(根)目录创建 Payload 文件夹并打包
           mkdir -p Payload
-          
-          # 将生成的 DexLoom.app 移动到 Payload 目录中
-          mv build/Build/Products/Release-iphoneos/DexLoom.app Payload/
-          
-          # 压缩为 DexLoom.ipa (静默压缩)
+          mv "$APP_PATH" Payload/
           zip -qr DexLoom.ipa Payload
           
           echo "打包完成！"
@@ -49,4 +68,4 @@ jobs:
         with:
           name: DexLoom-Release-IPA
           path: DexLoom.ipa
-          retention-days: 7 # 编译出来的产物在 GitHub 上保留 7 天
+          retention-days: 7
