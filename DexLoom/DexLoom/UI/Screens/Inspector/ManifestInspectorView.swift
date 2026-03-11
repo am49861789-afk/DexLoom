@@ -4,7 +4,7 @@ struct ManifestInspectorView: View {
     @ObservedObject var bridge: RuntimeBridge
     @State private var manifest: ManifestInfo?
     @State private var isLoading = false
-
+    
     var body: some View {
         NavigationStack {
             Group {
@@ -53,8 +53,8 @@ struct ManifestInspectorView: View {
                     loadManifest()
                 }
             }
-            .onChange(of: bridge.isLoaded) {
-                if bridge.isLoaded {
+            .onChange(of: bridge.isLoaded) { isLoaded in
+                if isLoaded {
                     loadManifest()
                 } else {
                     manifest = nil
@@ -62,13 +62,13 @@ struct ManifestInspectorView: View {
             }
         }
     }
-
+    
     private func loadManifest() {
         isLoading = true
         manifest = bridge.getManifestInfo()
         isLoading = false
     }
-
+    
     @ViewBuilder
     private func manifestContent(_ info: ManifestInfo) -> some View {
         ScrollView {
@@ -81,7 +81,7 @@ struct ManifestInspectorView: View {
                     manifestField("Target SDK", info.targetSdk > 0 ? "\(info.targetSdk)" : "not set")
                     manifestField("Theme", info.appTheme)
                 }
-
+                
                 // Activities
                 if !info.activities.isEmpty {
                     manifestSection("Activities (\(info.activities.count))", icon: "rectangle.stack.fill") {
@@ -90,7 +90,7 @@ struct ManifestInspectorView: View {
                         }
                     }
                 }
-
+                
                 // Services
                 if !info.services.isEmpty {
                     manifestSection("Services (\(info.services.count))", icon: "gearshape.2.fill") {
@@ -99,7 +99,7 @@ struct ManifestInspectorView: View {
                         }
                     }
                 }
-
+                
                 // Receivers
                 if !info.receivers.isEmpty {
                     manifestSection("Receivers (\(info.receivers.count))", icon: "antenna.radiowaves.left.and.right") {
@@ -108,7 +108,7 @@ struct ManifestInspectorView: View {
                         }
                     }
                 }
-
+                
                 // Providers
                 if !info.providers.isEmpty {
                     manifestSection("Providers (\(info.providers.count))", icon: "externaldrive.fill") {
@@ -117,7 +117,7 @@ struct ManifestInspectorView: View {
                         }
                     }
                 }
-
+                
                 // Permissions
                 if !info.permissions.isEmpty {
                     manifestSection("Permissions (\(info.permissions.count))", icon: "lock.shield.fill") {
@@ -129,7 +129,7 @@ struct ManifestInspectorView: View {
                         }
                     }
                 }
-
+                
                 // Features
                 if !info.features.isEmpty {
                     manifestSection("Features (\(info.features.count))", icon: "star.fill") {
@@ -152,13 +152,13 @@ struct ManifestInspectorView: View {
         }
         .background(Color.dxBackground)
     }
-
+    
     private func manifestSection<Content: View>(_ title: String, icon: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Label(title, systemImage: icon)
                 .font(.dxHeadline)
                 .foregroundStyle(Color.dxText)
-
+            
             VStack(alignment: .leading, spacing: 4) {
                 content()
             }
@@ -168,7 +168,7 @@ struct ManifestInspectorView: View {
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
     }
-
+    
     private func manifestField(_ label: String, _ value: String) -> some View {
         HStack(alignment: .top) {
             Text(label)
@@ -186,11 +186,10 @@ struct ManifestInspectorView: View {
 }
 
 // MARK: - Component Row
-
 struct ManifestComponentRow: View {
     let component: ManifestComponentInfo
     var isMain: Bool = false
-
+    
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
@@ -198,7 +197,7 @@ struct ManifestComponentRow: View {
                     .font(.dxCode)
                     .foregroundStyle(isMain ? Color.dxSecondary : Color.dxText)
                     .lineLimit(2)
-
+                
                 if isMain {
                     Text("LAUNCHER")
                         .font(.system(size: 9, weight: .bold, design: .monospaced))
@@ -208,14 +207,14 @@ struct ManifestComponentRow: View {
                         .foregroundStyle(Color.dxSecondary)
                         .clipShape(Capsule())
                 }
-
+                
                 if component.exported {
                     Text("exported")
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
                         .foregroundStyle(Color.dxWarning)
                 }
             }
-
+            
             // Intent filters
             ForEach(component.intentFilters) { filter in
                 VStack(alignment: .leading, spacing: 2) {
