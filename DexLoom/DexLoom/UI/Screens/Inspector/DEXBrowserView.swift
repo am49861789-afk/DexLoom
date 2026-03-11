@@ -5,16 +5,12 @@ struct DEXBrowserView: View {
     @State private var searchText = ""
     @State private var classes: [DEXClassInfo] = []
     @State private var isLoading = false
-
+    
     var filteredClasses: [DEXClassInfo] {
-        if searchText.isEmpty {
-            return classes
-        }
-        return classes.filter {
-            $0.name.localizedCaseInsensitiveContains(searchText)
-        }
+        if searchText.isEmpty { return classes }
+        return classes.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
-
+    
     var body: some View {
         NavigationStack {
             Group {
@@ -68,7 +64,7 @@ struct DEXBrowserView: View {
                         .padding(.horizontal)
                         .padding(.vertical, 8)
                         .background(Color.dxSurface)
-
+                        
                         List(filteredClasses) { cls in
                             NavigationLink(value: cls) {
                                 DEXClassRow(classInfo: cls)
@@ -92,8 +88,8 @@ struct DEXBrowserView: View {
                     loadClasses()
                 }
             }
-            .onChange(of: bridge.isLoaded) {
-                if bridge.isLoaded {
+            .onChange(of: bridge.isLoaded) { isLoaded in
+                if isLoaded {
                     loadClasses()
                 } else {
                     classes = []
@@ -101,7 +97,7 @@ struct DEXBrowserView: View {
             }
         }
     }
-
+    
     private func loadClasses() {
         isLoading = true
         classes = bridge.getDEXClasses()
@@ -110,17 +106,14 @@ struct DEXBrowserView: View {
 }
 
 // MARK: - Class Row
-
 struct DEXClassRow: View {
     let classInfo: DEXClassInfo
-
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(classInfo.displayName)
                 .font(.dxCode)
                 .foregroundStyle(Color.dxText)
                 .lineLimit(1)
-
             HStack(spacing: 12) {
                 Label("\(classInfo.methodCount)", systemImage: "function")
                     .font(.system(size: 11, design: .monospaced))
@@ -128,7 +121,6 @@ struct DEXClassRow: View {
                 Label("\(classInfo.fieldCount)", systemImage: "list.bullet")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(Color.dxSecondary)
-
                 if !classInfo.accessFlagsText.isEmpty {
                     Text(classInfo.accessFlagsText)
                         .font(.system(size: 10, design: .monospaced))
@@ -141,13 +133,12 @@ struct DEXClassRow: View {
 }
 
 // MARK: - Class Detail
-
 struct DEXClassDetailView: View {
     let bridge: RuntimeBridge
     let classInfo: DEXClassInfo
     @State private var detail: DEXClassDetail?
     @State private var isLoading = true
-
+    
     var body: some View {
         Group {
             if isLoading {
@@ -173,25 +164,23 @@ struct DEXClassDetailView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(Color.dxSurface)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
-
+                        
                         // Methods section
                         if !detail.methods.isEmpty {
                             sectionHeader("Methods (\(detail.methods.count))", icon: "function")
-
                             ForEach(detail.methods) { method in
                                 DEXMethodRow(method: method)
                             }
                         }
-
+                        
                         // Fields section
                         if !detail.fields.isEmpty {
                             sectionHeader("Fields (\(detail.fields.count))", icon: "list.bullet")
-
                             ForEach(detail.fields) { field in
                                 DEXFieldRow(field: field)
                             }
                         }
-
+                        
                         if detail.methods.isEmpty && detail.fields.isEmpty {
                             Text("No class data available (abstract/interface with no code)")
                                 .font(.dxCaption)
@@ -218,7 +207,7 @@ struct DEXClassDetailView: View {
             isLoading = false
         }
     }
-
+    
     private func sectionHeader(_ title: String, icon: String) -> some View {
         Label(title, systemImage: icon)
             .font(.dxHeadline)
@@ -228,32 +217,26 @@ struct DEXClassDetailView: View {
 }
 
 // MARK: - Method Row
-
 struct DEXMethodRow: View {
     let method: DEXMethodInfo
-
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(method.name)
                 .font(.dxCode)
                 .foregroundStyle(Color.dxPrimary)
-
             Text(method.descriptor)
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(Color.dxTextSecondary)
                 .lineLimit(2)
-
             HStack(spacing: 12) {
                 if !method.accessFlagsText.isEmpty {
                     Text(method.accessFlagsText)
                         .font(.system(size: 10, weight: .medium, design: .monospaced))
                         .foregroundStyle(Color.dxWarning)
                 }
-
                 Text("regs: \(method.registerCount)")
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(Color.dxTextSecondary)
-
                 Text("code: \(method.codeSize) units")
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(Color.dxTextSecondary)
@@ -267,10 +250,8 @@ struct DEXMethodRow: View {
 }
 
 // MARK: - Field Row
-
 struct DEXFieldRow: View {
     let field: DEXFieldInfo
-
     var body: some View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
